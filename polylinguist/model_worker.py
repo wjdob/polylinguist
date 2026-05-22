@@ -5,6 +5,7 @@ import sys
 
 from polylinguist.services.languages import get_language
 from polylinguist.services.translation import (
+    NLLB_BATCH_SIZE,
     TranslationError,
     _argos_path_from_model_id,
     _hf_runtime_packages,
@@ -117,6 +118,8 @@ def translate_marian(model_id: str, target_lang: str, cues: list[str], device_pr
     device = _resolve_device_preference(device_preference)
     if device != "cpu":
         model = model.to(device)
+    if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
+        model.generation_config.max_length = None
     emit("load", f"Model loaded on {device}.")
     batch_size = 8
     total_batches = (len(cues) + batch_size - 1) // batch_size
@@ -150,16 +153,25 @@ def translate_nllb(model_id: str, source_lang: str, target_lang: str, cues: list
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
     if device != "cpu":
         model = model.to(device)
+    if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
+        model.generation_config.max_length = None
     emit("load", f"Model loaded on {device}.")
-    emit("translate", f"Translating batch 1/1.")
-    encoded = tokenizer(cues, return_tensors="pt", padding=True, truncation=True)
-    if device != "cpu":
-        encoded = {key: value.to(device) for key, value in encoded.items()}
-    generated = model.generate(
-        **encoded,
-        forced_bos_token_id=tokenizer.convert_tokens_to_ids(target.nllb_code),
-    )
-    return tokenizer.batch_decode(generated, skip_special_tokens=True)
+    total_batches = (len(cues) + NLLB_BATCH_SIZE - 1) // NLLB_BATCH_SIZE
+    translations: list[str] = []
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(target.nllb_code)
+    with torch.no_grad():
+        for batch_index, start in enumerate(range(0, len(cues), NLLB_BATCH_SIZE), start=1):
+            emit("translate", f"Translating batch {batch_index}/{total_batches}.")
+            batch = cues[start : start + NLLB_BATCH_SIZE]
+            encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+            if device != "cpu":
+                encoded = {key: value.to(device) for key, value in encoded.items()}
+            generated = model.generate(
+                **encoded,
+                forced_bos_token_id=forced_bos_token_id,
+            )
+            translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    return translations
 
 
 def emit(stage: str, message: str) -> None:

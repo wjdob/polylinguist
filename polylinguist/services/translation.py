@@ -27,6 +27,8 @@ PACKAGE_MODULES = {
     "argostranslate": "argostranslate",
 }
 
+NLLB_BATCH_SIZE = 16
+
 
 class TranslationError(RuntimeError):
     pass
@@ -253,6 +255,8 @@ class MarianTranslator(TranslatorAdapter):
         model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
         if device != "cpu":
             model = model.to(device)
+        if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
+            model.generation_config.max_length = None
         bundle = {"tokenizer": tokenizer, "model": model, "device": device}
         self._bundles[cache_key] = bundle
         _notify(progress, "load", f"Model loaded on {device}.")
@@ -314,14 +318,25 @@ class NllbTranslator(TranslatorAdapter):
                 raise TranslationError("Requested language pair is not available in NLLB.")
             tokenizer = bundle["tokenizer"]
             model = bundle["model"]
-            encoded = tokenizer(cues, return_tensors="pt", padding=True, truncation=True)
-            if device != "cpu":
-                encoded = {key: value.to(device) for key, value in encoded.items()}
-            generated = model.generate(
-                **encoded,
-                forced_bos_token_id=tokenizer.convert_tokens_to_ids(target.nllb_code),
-            )
-            return tokenizer.batch_decode(generated, skip_special_tokens=True)
+            translations: list[str] = []
+            total_batches = (len(cues) + NLLB_BATCH_SIZE - 1) // NLLB_BATCH_SIZE
+            forced_bos_token_id = tokenizer.convert_tokens_to_ids(target.nllb_code)
+            import torch  # type: ignore
+
+            model.eval()
+            with torch.no_grad():
+                for batch_index, start in enumerate(range(0, len(cues), NLLB_BATCH_SIZE), start=1):
+                    _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
+                    batch = cues[start : start + NLLB_BATCH_SIZE]
+                    encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+                    if device != "cpu":
+                        encoded = {key: value.to(device) for key, value in encoded.items()}
+                    generated = model.generate(
+                        **encoded,
+                        forced_bos_token_id=forced_bos_token_id,
+                    )
+                    translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+            return translations
         _notify(progress, "runtime", f"Using NLLB worker runtime: {runtime_executable}")
         return _run_worker(
             runtime_executable,
@@ -348,6 +363,8 @@ class NllbTranslator(TranslatorAdapter):
         model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
         if device != "cpu":
             model = model.to(device)
+        if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
+            model.generation_config.max_length = None
         bundle = {"tokenizer": tokenizer, "model": model, "device": device}
         self._bundles[cache_key] = bundle
         _notify(progress, "load", f"Model loaded on {device}.")

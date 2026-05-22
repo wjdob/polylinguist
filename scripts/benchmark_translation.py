@@ -141,6 +141,8 @@ def benchmark_hf(
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id, **model_kwargs)
     model = model.to(device)
     model.eval()
+    if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
+        model.generation_config.max_length = None
     load_seconds = time.perf_counter() - load_started
 
     if device == "cuda":

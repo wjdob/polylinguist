@@ -1,0 +1,26 @@
+{
+  "provider": "nllb",
+  "model": "facebook/nllb-200-distilled-600M",
+  "requested_device": "cuda",
+  "effective_device": "cuda",
+  "dtype": "float16",
+  "subtitle": "C:\\Users\\wdob\\Downloads\\Marvel's.The.Punisher.S02E05.720p.WEB.x264-STRiFE.srt",
+  "source_lang": "eng",
+  "target_lang": "pol",
+  "cue_count": 585,
+  "char_count": 19505,
+  "batch_size": 32,
+  "target_token": null,
+  "setup_seconds": 5.935,
+  "load_seconds": 7.357,
+  "translation_seconds": 39.401,
+  "total_seconds": 52.776,
+  "cues_per_second": 14.847,
+  "chars_per_second": 495.039,
+  "gpu_memory_mb": 1356.6,
+  "sample_output": [
+    "- Trzymaj królową w oczach, prawda?",
+    "- Ocz na królową.",
+    "Ale uważaj na zapieków."
+  ]
+}

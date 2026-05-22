@@ -163,9 +163,25 @@ Results:
 | Argos Translate | `argos:en-pl` | CPU | `111.14s` | `5.264 cues/s` | Fastest CPU result in this environment |
 | MarianMT | `Helsinki-NLP/opus-mt-en-ine` | CPU | `177.148s` | `3.302 cues/s` | Used Polish target token `>>pol<<` |
 | MarianMT | `Helsinki-NLP/opus-mt-en-ine` | GPU | `41.298s` | `14.165 cues/s` | Peak GPU allocation about `386 MB` |
+| NLLB-200 distilled 600M | `facebook/nllb-200-distilled-600M` | GPU | `39.401s` | `14.847 cues/s` | Stable after reboot with `fp16`, `batch_size=32`, `low_cpu_mem_usage`; peak GPU allocation about `1356.6 MB` |
 
 The benchmark runner lives in
 [`scripts/benchmark_translation.py`](scripts/benchmark_translation.py).
+
+The current known-good NLLB GPU benchmark command is:
+
+```powershell
+.benchmarks\venv\Scripts\python.exe scripts\benchmark_translation.py `
+  --subtitle "C:\Users\wdob\Downloads\Marvel's.The.Punisher.S02E05.720p.WEB.x264-STRiFE.srt" `
+  --provider nllb `
+  --device cuda `
+  --source-lang eng `
+  --target-lang pol `
+  --model-id facebook/nllb-200-distilled-600M `
+  --batch-size 32 `
+  --dtype fp16 `
+  --low-cpu-mem-usage
+```
 
 ## Development
 

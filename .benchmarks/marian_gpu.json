@@ -1,0 +1,26 @@
+{
+  "provider": "marian",
+  "model": "Helsinki-NLP/opus-mt-en-ine",
+  "requested_device": "cuda",
+  "effective_device": "cuda",
+  "dtype": "default",
+  "subtitle": "c:\\Users\\wdob\\Downloads\\Marvel's.The.Punisher.S02E05.720p.WEB.x264-STRiFE.srt",
+  "source_lang": "eng",
+  "target_lang": "pol",
+  "cue_count": 585,
+  "char_count": 19505,
+  "batch_size": 8,
+  "target_token": "pol",
+  "setup_seconds": 8.277,
+  "load_seconds": 5.289,
+  "translation_seconds": 41.298,
+  "total_seconds": 54.874,
+  "cues_per_second": 14.165,
+  "chars_per_second": 472.301,
+  "gpu_memory_mb": 386.4,
+  "sample_output": [
+    "Uważaj na królową, prawda?",
+    "Oko na królową, na królową.",
+    "Ale uważaj na jacks."
+  ]
+}

@@ -1,0 +1,8 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+.polylinguist/
+polylinguist.egg-info/
+.venv/
+.benchmarks/venv/
+.uvicorn*.log

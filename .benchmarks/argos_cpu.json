@@ -1,0 +1,25 @@
+{
+  "provider": "argos",
+  "model": "argos:en-pl",
+  "requested_device": "cpu",
+  "effective_device": "cpu",
+  "dtype": null,
+  "subtitle": "c:\\Users\\wdob\\Downloads\\Marvel's.The.Punisher.S02E05.720p.WEB.x264-STRiFE.srt",
+  "source_lang": "eng",
+  "target_lang": "pol",
+  "cue_count": 585,
+  "char_count": 19505,
+  "batch_size": 8,
+  "setup_seconds": 9.076,
+  "load_seconds": 0.0,
+  "translation_seconds": 111.14,
+  "total_seconds": 120.216,
+  "cues_per_second": 5.264,
+  "chars_per_second": 175.499,
+  "gpu_memory_mb": null,
+  "sample_output": [
+    "Dobrze. Miej oko na królową, prawda?",
+    "- Tak, tak, tak.\n- Patrz na królową. Patrz na królową.",
+    "Ale uważaj na walety. Uważaj na walety."
+  ]
+}

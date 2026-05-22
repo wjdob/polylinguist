@@ -86,6 +86,18 @@ class ModelInstallResponse(BaseModel):
     detail: str
 
 
+class ModelRemoveRequest(BaseModel):
+    provider: str
+    model_id: str
+    processing_device: ProcessingDevice = "auto"
+
+
+class CleanupResponse(BaseModel):
+    detail: str
+    removed_paths: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class InstallJobResponse(BaseModel):
     job_id: str
     provider: str

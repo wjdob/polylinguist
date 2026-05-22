@@ -121,3 +121,7 @@ class SubtitleGenerationTracker:
             job.detail = str(error)
             job.updated_at = datetime.now(timezone.utc)
             job.log_lines.append(f"[failed] {error}")
+
+    def clear(self) -> None:
+        with self._lock:
+            self._jobs.clear()

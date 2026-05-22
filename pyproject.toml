@@ -40,6 +40,7 @@ dev = [
 
 [project.scripts]
 polylinguist = "polylinguist.main:main"
+polylinguist-uninstall = "polylinguist.uninstall:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -9,6 +9,7 @@ from polylinguist.services.translation import (
     NLLB_BATCH_SIZE,
     TranslationError,
     _argos_path_from_model_id,
+    _configure_huggingface_windows_cache,
     _hf_runtime_packages,
     _install_marian_directml_current,
     _install_marian_openvino_current,
@@ -17,6 +18,7 @@ from polylinguist.services.translation import (
     _ort_runtime_packages,
     _prepare_marian_batch,
     _resolve_device_preference,
+    _wrap_huggingface_windows_privilege_error,
 )
 
 
@@ -104,8 +106,14 @@ def install_argos(model_id: str, install_strategy: str) -> str:
 def install_hf(model_id: str) -> str:
     from huggingface_hub import snapshot_download  # type: ignore
 
+    _configure_huggingface_windows_cache()
     emit("download", f"Downloading model weights for {model_id}.")
-    location = snapshot_download(repo_id=model_id)
+    if sys.platform.startswith("win"):
+        emit("runtime", "Windows detected; using Hugging Face no-symlink cache mode.")
+    try:
+        location = snapshot_download(repo_id=model_id)
+    except OSError as exc:
+        _wrap_huggingface_windows_privilege_error(exc)
     return f"Downloaded {model_id} to {location}"
 
 

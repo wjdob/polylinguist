@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import importlib.util
 import json
 import os
+import platform
 from pathlib import Path
 from queue import Empty, Queue
 import subprocess
@@ -38,6 +39,25 @@ PACKAGE_MODULES = {
 
 MARIAN_BATCH_SIZE = 8
 NLLB_BATCH_SIZE = 16
+
+
+def _configure_huggingface_windows_cache() -> None:
+    if platform.system().lower() != "windows":
+        return
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+
+
+def _wrap_huggingface_windows_privilege_error(exc: OSError) -> TranslationError:
+    if getattr(exc, "winerror", None) != 1314:
+        raise exc
+    raise TranslationError(
+        "Windows blocked Hugging Face cache symlink creation (WinError 1314). "
+        "Polylinguist now uses Hugging Face no-symlink cache mode on Windows; retry the install. "
+        "If the machine still blocks it, enable Windows Developer Mode or run Polylinguist once as administrator."
+    ) from exc
+
+
+_configure_huggingface_windows_cache()
 
 
 class TranslationError(RuntimeError):
@@ -84,6 +104,12 @@ class TranslatorAdapter:
     ) -> list[str]:
         raise NotImplementedError
 
+    def forget_model(self, model_id: str, target: str | None = None) -> None:
+        return None
+
+    def clear_runtime_state(self) -> None:
+        return None
+
 
 class TranslationManager:
     def __init__(self, registry: InstalledModelRegistry, model_artifacts_dir: Path) -> None:
@@ -107,24 +133,43 @@ class TranslationManager:
     def is_installed(self, provider: str, model_id: str, device_preference: str = "auto") -> bool:
         normalized = _normalize_device_preference(device_preference)
         if provider == "argos":
+            if self.registry.is_removed(provider, model_id):
+                return False
             return self.registry.is_installed(provider, model_id)
         if provider == "marian":
             if normalized == "auto":
                 return (
-                    self.registry.is_installed(provider, model_id)
-                    or self.registry.is_installed(provider, model_id, "directml")
-                    or self.registry.is_installed(provider, model_id, "openvino_gpu")
-                    or hf_model_cache_exists(model_id)
-                    or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "directml")
-                    or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "openvino_gpu")
+                    (not self.registry.is_removed(provider, model_id) and (
+                        self.registry.is_installed(provider, model_id) or hf_model_cache_exists(model_id)
+                    ))
+                    or (
+                        not self.registry.is_removed(provider, model_id, "directml")
+                        and (
+                            self.registry.is_installed(provider, model_id, "directml")
+                            or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "directml")
+                        )
+                    )
+                    or (
+                        not self.registry.is_removed(provider, model_id, "openvino_gpu")
+                        and (
+                            self.registry.is_installed(provider, model_id, "openvino_gpu")
+                            or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "openvino_gpu")
+                        )
+                    )
                 )
             if normalized in {"directml", "openvino_gpu"}:
+                if self.registry.is_removed(provider, model_id, normalized):
+                    return False
                 return self.registry.is_installed(provider, model_id, normalized) or local_model_artifact_exists(
                     self.model_artifacts_dir, provider, model_id, normalized
                 )
+            if self.registry.is_removed(provider, model_id):
+                return False
             return self.registry.is_installed(provider, model_id) or hf_model_cache_exists(model_id)
         if provider == "nllb":
             if normalized in {"directml", "openvino_gpu"}:
+                return False
+            if self.registry.is_removed(provider, model_id):
                 return False
             return self.registry.is_installed(provider, model_id) or hf_model_cache_exists(model_id)
         return self.registry.is_installed(provider, model_id)
@@ -141,6 +186,15 @@ class TranslationManager:
             )
         adapter = self.adapters[request.provider]
         return adapter.translate_batch(request, cues, progress)
+
+    def forget_model(self, provider: str, model_id: str, target: str | None = None) -> None:
+        adapter = self.adapters.get(provider)
+        if adapter is not None:
+            adapter.forget_model(model_id, target)
+
+    def clear_runtime_state(self) -> None:
+        for adapter in self.adapters.values():
+            adapter.clear_runtime_state()
 
 
 class ArgosTranslator(TranslatorAdapter):
@@ -207,6 +261,9 @@ class ArgosTranslator(TranslatorAdapter):
             },
             progress=progress,
         )
+
+    def forget_model(self, model_id: str, target: str | None = None) -> None:
+        return None
 
 
 class MarianTranslator(TranslatorAdapter):
@@ -410,6 +467,22 @@ class MarianTranslator(TranslatorAdapter):
 
     def _artifact_dir(self, model_id: str, target: str) -> Path:
         return local_model_artifact_dir(self.model_artifacts_dir, self.provider, model_id, target)
+
+    def forget_model(self, model_id: str, target: str | None = None) -> None:
+        normalized = _normalize_device_preference(target or "auto")
+        if normalized in {"directml", "openvino_gpu"}:
+            artifact_dir = str(self._artifact_dir(model_id, normalized))
+            for cache_key in list(self._bundles):
+                if cache_key == (artifact_dir, normalized):
+                    self._bundles.pop(cache_key, None)
+            return
+        for cache_key in list(self._bundles):
+            cache_model_id, cache_device = cache_key
+            if cache_model_id == model_id and cache_device in {"cpu", "cuda"}:
+                self._bundles.pop(cache_key, None)
+
+    def clear_runtime_state(self) -> None:
+        self._bundles.clear()
 
     def _effective_target(self, requested_target: str, model_id: str) -> str:
         normalized = _normalize_device_preference(requested_target)
@@ -619,6 +692,21 @@ class NllbTranslator(TranslatorAdapter):
         _notify(progress, "load", f"Model loaded on {device}.")
         return bundle
 
+    def forget_model(self, model_id: str, target: str | None = None) -> None:
+        for cache_key in list(self._bundles):
+            cache_model_id, cache_device = cache_key
+            if cache_model_id != model_id:
+                continue
+            if target is None:
+                self._bundles.pop(cache_key, None)
+                continue
+            normalized = _normalize_device_preference(target)
+            if normalized == "auto" or normalized == cache_device:
+                self._bundles.pop(cache_key, None)
+
+    def clear_runtime_state(self) -> None:
+        self._bundles.clear()
+
 
 def _install_argos_current(descriptor: ModelDescriptor, progress: ProgressCallback | None = None) -> str:
     import argostranslate.package  # type: ignore
@@ -672,8 +760,14 @@ def _translate_argos_current(
 def _install_hf_current(model_id: str, progress: ProgressCallback | None = None) -> str:
     from huggingface_hub import snapshot_download  # type: ignore
 
+    _configure_huggingface_windows_cache()
     _notify(progress, "download", f"Downloading model weights for {model_id}.")
-    location = snapshot_download(repo_id=model_id)
+    if os.environ.get("HF_HUB_DISABLE_SYMLINKS") == "1" and platform.system().lower() == "windows":
+        _notify(progress, "runtime", "Windows detected; using Hugging Face no-symlink cache mode.")
+    try:
+        location = snapshot_download(repo_id=model_id)
+    except OSError as exc:
+        _wrap_huggingface_windows_privilege_error(exc)
     return f"Downloaded {model_id} to {location}"
 
 
@@ -687,8 +781,14 @@ def _install_marian_directml_current(
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     _notify(progress, "download", f"Exporting MarianMT model to DirectML-ready ONNX artifacts for {model_id}.")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = ORTModelForSeq2SeqLM.from_pretrained(model_id, export=True)
+    _configure_huggingface_windows_cache()
+    if os.environ.get("HF_HUB_DISABLE_SYMLINKS") == "1" and platform.system().lower() == "windows":
+        _notify(progress, "runtime", "Windows detected; using Hugging Face no-symlink cache mode.")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = ORTModelForSeq2SeqLM.from_pretrained(model_id, export=True)
+    except OSError as exc:
+        _wrap_huggingface_windows_privilege_error(exc)
     model.save_pretrained(str(artifact_dir))
     tokenizer.save_pretrained(str(artifact_dir))
     return f"Exported DirectML artifacts for {model_id} to {artifact_dir}"
@@ -704,8 +804,14 @@ def _install_marian_openvino_current(
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     _notify(progress, "download", f"Exporting MarianMT model to OpenVINO artifacts for {model_id}.")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True, compile=False)
+    _configure_huggingface_windows_cache()
+    if os.environ.get("HF_HUB_DISABLE_SYMLINKS") == "1" and platform.system().lower() == "windows":
+        _notify(progress, "runtime", "Windows detected; using Hugging Face no-symlink cache mode.")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True, compile=False)
+    except OSError as exc:
+        _wrap_huggingface_windows_privilege_error(exc)
     model.save_pretrained(str(artifact_dir))
     tokenizer.save_pretrained(str(artifact_dir))
     return f"Exported OpenVINO artifacts for {model_id} to {artifact_dir}"

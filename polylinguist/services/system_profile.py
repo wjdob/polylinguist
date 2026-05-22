@@ -104,26 +104,20 @@ def _detect_accelerators(system: str) -> Iterable[AcceleratorInfo]:
 
     if system == "windows":
         adapters = _detect_windows_video_adapters()
-        if _directml_runtime_ready():
-            for adapter in adapters:
-                if adapter.vendor == "amd":
-                    accelerators.append(
-                        AcceleratorInfo(
-                            vendor="amd",
-                            name=adapter.name,
-                            supported_targets=("directml",),
-                        )
+        for adapter in adapters:
+            supported_targets: list[str] = []
+            if adapter.vendor == "amd" and _supports_directml_adapter(adapter):
+                supported_targets.append("directml")
+            if adapter.vendor == "intel" and _supports_openvino_gpu_adapter(adapter):
+                supported_targets.append("openvino_gpu")
+            if supported_targets:
+                accelerators.append(
+                    AcceleratorInfo(
+                        vendor=adapter.vendor,
+                        name=adapter.name,
+                        supported_targets=tuple(supported_targets),
                     )
-        if _openvino_gpu_ready():
-            for adapter in adapters:
-                if adapter.vendor == "intel":
-                    accelerators.append(
-                        AcceleratorInfo(
-                            vendor="intel",
-                            name=adapter.name,
-                            supported_targets=("openvino_gpu",),
-                        )
-                    )
+                )
     return _dedupe_accelerators(accelerators)
 
 
@@ -265,6 +259,22 @@ def _normalize_vendor(value: str) -> str | None:
     if "apple" in lowered:
         return "apple"
     return None
+
+
+def _supports_directml_adapter(adapter: _VideoAdapter) -> bool:
+    if adapter.vendor != "amd":
+        return False
+    lowered = adapter.name.lower()
+    unsupported_markers = ("basic display", "remote display", "virtual", "hyper-v")
+    return not any(marker in lowered for marker in unsupported_markers)
+
+
+def _supports_openvino_gpu_adapter(adapter: _VideoAdapter) -> bool:
+    if adapter.vendor != "intel":
+        return False
+    lowered = adapter.name.lower()
+    unsupported_markers = ("basic display", "remote display", "virtual", "hyper-v")
+    return not any(marker in lowered for marker in unsupported_markers)
 
 
 def _directml_runtime_ready() -> bool:

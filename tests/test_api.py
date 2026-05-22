@@ -51,6 +51,12 @@ class FakeTranslationManager:
         self.installed.add((descriptor.provider, descriptor.model_id))
         return "installed"
 
+    def forget_model(self, provider, model_id, target=None):
+        self.installed.discard((provider, model_id))
+
+    def clear_runtime_state(self):
+        return None
+
 
 def build_test_app(tmp_path: Path):
     paths = AppPaths(
@@ -280,6 +286,61 @@ def test_install_job_status(tmp_path: Path):
     payload = status.json()
     assert payload["status"] in {"running", "completed"}
     assert payload["provider"] == "marian"
+
+
+def test_remove_model_clears_selected_model(tmp_path: Path):
+    app = build_test_app(tmp_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/models/remove",
+        json={
+            "provider": "marian",
+            "model_id": "fake-model",
+            "processing_device": "cpu",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "Removed" in payload["detail"]
+    assert payload["notes"]
+
+    settings = client.get("/api/settings").json()["settings"]
+    assert settings["preferred_provider"] == "auto"
+    assert settings["selected_model_id"] is None
+
+
+def test_uninstall_local_data_resets_settings(tmp_path: Path):
+    paths = AppPaths(
+        root=tmp_path / ".polylinguist",
+        cache_dir=tmp_path / ".polylinguist" / "cache",
+        model_artifacts_dir=tmp_path / ".polylinguist" / "models",
+        settings_file=tmp_path / ".polylinguist" / "settings.json",
+        installed_models_file=tmp_path / ".polylinguist" / "installed_models.json",
+        metadata_cache_file=tmp_path / ".polylinguist" / "cache" / "model_metadata.json",
+        generated_subtitles_dir=tmp_path / ".polylinguist" / "cache" / "subtitles",
+    )
+    services = create_services(paths, AppConfig.detect())
+    services.settings_store.save(
+        AddonSettings(
+            source_lang="eng",
+            target_lang="spa",
+            preferred_provider="marian",
+            selected_model_id="fake-model",
+        )
+    )
+    paths.generated_subtitles_dir.mkdir(parents=True, exist_ok=True)
+    (paths.generated_subtitles_dir / "cached.srt").write_text("1", encoding="utf-8")
+
+    result = services.uninstall_local_data()
+
+    assert "first-run defaults" in result["detail"]
+    assert result["notes"]
+    settings = services.settings_store.load().settings
+    assert settings.preferred_provider == "auto"
+    assert settings.selected_model_id is None
+    assert settings.source_lang == "eng"
 
 
 def test_settings_round_trip_includes_processing_device(tmp_path: Path):

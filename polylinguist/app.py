@@ -14,11 +14,12 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from polylinguist.config import AppConfig, AppPaths
 from polylinguist.schemas import (
     AddonSettings,
+    CleanupResponse,
     InstallJobResponse,
     LanguageResponse,
     ModelCatalogResponse,
     ModelInstallRequest,
-    ModelInstallResponse,
+    ModelRemoveRequest,
     SettingsEnvelope,
 )
 from polylinguist.services.languages import list_languages
@@ -194,6 +195,17 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="Install job not found.")
         return InstallJobResponse.model_validate(job.to_dict())
+
+    @app.post("/api/models/remove", response_model=CleanupResponse)
+    async def remove_model(request: Request, payload: ModelRemoveRequest) -> CleanupResponse:
+        require_admin_access(request)
+        services = get_services(request)
+        result = services.remove_model_installation(
+            payload.provider,
+            payload.model_id,
+            payload.processing_device,
+        )
+        return CleanupResponse.model_validate(result)
 
     @app.get("/api/subtitles/status")
     async def get_subtitle_activity(request: Request) -> dict[str, Any]:
@@ -603,10 +615,27 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       background: var(--accent-strong);
       border-color: var(--accent-strong);
     }}
+    button:disabled {{
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+      background: var(--surface-3);
+      border-color: var(--line);
+    }}
     button.secondary {{
       background: transparent;
       color: var(--ink);
       border: 1px solid var(--line-strong);
+    }}
+    button.danger {{
+      background: transparent;
+      color: #ffb5bb;
+      border: 1px solid #7c1d24;
+    }}
+    button.danger:hover {{
+      background: #301012;
+      border-color: #a3232d;
+      color: #fff;
     }}
     .model-list {{
       display: grid;
@@ -985,15 +1014,7 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
         " • CUDA: " + (profile.has_cuda ? "yes" : "no") +
         " • MPS: " + (profile.has_mps ? "yes" : "no") +
         acceleratorSummary;
-      const supportedTargets = new Set(["cpu", "auto"]);
-      if (profile.has_cuda) {{
-        supportedTargets.add("cuda");
-      }}
-      for (const accelerator of profile.accelerators || []) {{
-        for (const target of accelerator.supported_targets || []) {{
-          supportedTargets.add(target);
-        }}
-      }}
+      const supportedTargets = supportedTargetsFromProfile(profile);
       for (const value of ["cuda", "directml", "openvino_gpu"]) {{
         const option = document.querySelector('#processing-device option[value="' + value + '"]');
         if (!option) {{
@@ -1004,6 +1025,33 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       if (!supportedTargets.has(document.getElementById("processing-device").value) && document.getElementById("processing-device").value !== "auto") {{
         document.getElementById("processing-device").value = "auto";
       }}
+    }}
+
+    function supportedTargetsFromProfile(profile) {{
+      const supportedTargets = new Set(["cpu", "auto"]);
+      if (profile.has_cuda) {{
+        supportedTargets.add("cuda");
+      }}
+      for (const accelerator of profile.accelerators || []) {{
+        for (const target of accelerator.supported_targets || []) {{
+          supportedTargets.add(target);
+        }}
+      }}
+      return supportedTargets;
+    }}
+
+    function applySettingsToForm(settings) {{
+      currentSettings = settings;
+      document.getElementById("source-lang").value = currentSettings.source_lang;
+      document.getElementById("target-lang").value = currentSettings.target_lang;
+      document.getElementById("format-mode").value = currentSettings.format_mode;
+      const requestedTarget = currentSettings.processing_device || "auto";
+      const supportedTargets = systemProfile ? supportedTargetsFromProfile(systemProfile) : new Set(["auto", "cpu"]);
+      document.getElementById("processing-device").value =
+        supportedTargets.has(requestedTarget)
+          ? requestedTarget
+          : "auto";
+      renderManifest(currentSettings);
     }}
 
     function renderModels(payload) {{
@@ -1027,6 +1075,9 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
         const canInstall = isModelSelectableForTarget(item, selectedTarget);
         const installedForTarget = (item.installed_targets || []).includes(selectedTarget);
         const badge = item.recommended ? "Recommended for this machine" : item.available ? "Available" : "Unavailable";
+        const removeButton = installedForTarget
+          ? '<button type="button" class="secondary danger" data-action="remove" data-provider="' + item.provider + '" data-model-id="' + item.model_id + '" data-target="' + selectedTarget + '">Remove ' + selectedTarget + '</button>'
+          : "";
         div.innerHTML =
           "<strong>" + item.label + "</strong>" +
           "<div class=\\"meta\\">" + badge + " • " + item.size_mb + " MB • " + item.license + "</div>" +
@@ -1037,11 +1088,15 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
             "<button type=\\"button\\" " + (canInstall ? "" : "disabled") + " data-provider=\\"" + item.provider + "\\" data-model-id=\\"" + item.model_id + "\\" data-target=\\"" + selectedTarget + "\\">" +
               (installedForTarget ? "Reinstall for " + selectedTarget : "Install for " + selectedTarget) +
             "</button>" +
+            removeButton +
           "</div>";
         container.appendChild(div);
       }}
-      for (const button of container.querySelectorAll("button[data-provider]")) {{
+      for (const button of container.querySelectorAll('button[data-provider]:not([data-action="remove"])')) {{
         button.addEventListener("click", installModel);
+      }}
+      for (const button of container.querySelectorAll('button[data-action="remove"]')) {{
+        button.addEventListener("click", removeModel);
       }}
     }}
 
@@ -1227,6 +1282,33 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       }}
     }}
 
+    async function removeModel(event) {{
+      const provider = event.currentTarget.dataset.provider;
+      const modelId = event.currentTarget.dataset.modelId;
+      const target = event.currentTarget.dataset.target || "auto";
+      if (!window.confirm("Remove this installed target from Polylinguist? Shared model caches used by other tools will be left in place.")) {{
+        return;
+      }}
+      document.getElementById("model-status").textContent = "Removing " + provider + " for " + target + "...";
+      try {{
+        const result = await loadJson("/api/models/remove", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            provider: provider,
+            model_id: modelId,
+            processing_device: target
+          }})
+        }});
+        const note = (result.notes || []).join(" ");
+        document.getElementById("model-status").textContent = result.detail + (note ? " " + note : "");
+        await syncSettingsFromServer();
+        await refreshSubtitleActivity();
+      }} catch (error) {{
+        document.getElementById("model-status").textContent = error.message;
+      }}
+    }}
+
     async function saveSettings() {{
       const settings = readSettings();
       document.getElementById("settings-status").textContent = "Saving local defaults...";
@@ -1242,6 +1324,12 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       }} catch (error) {{
         document.getElementById("settings-status").textContent = error.message;
       }}
+    }}
+
+    async function syncSettingsFromServer() {{
+      const envelope = await loadJson("/api/settings");
+      applySettingsToForm(envelope.settings);
+      await evaluateModels();
     }}
 
     function refreshManifestPreview() {{
@@ -1260,25 +1348,7 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       ]);
       fillLanguages(languages);
       renderSystemProfile(profile);
-      currentSettings = envelope.settings;
-      document.getElementById("source-lang").value = currentSettings.source_lang;
-      document.getElementById("target-lang").value = currentSettings.target_lang;
-      document.getElementById("format-mode").value = currentSettings.format_mode;
-      const requestedTarget = currentSettings.processing_device || "auto";
-      const supportedTargets = new Set(["auto", "cpu"]);
-      if (profile.has_cuda) {{
-        supportedTargets.add("cuda");
-      }}
-      for (const accelerator of profile.accelerators || []) {{
-        for (const target of accelerator.supported_targets || []) {{
-          supportedTargets.add(target);
-        }}
-      }}
-      document.getElementById("processing-device").value =
-        supportedTargets.has(requestedTarget)
-          ? requestedTarget
-          : "auto";
-      renderManifest(currentSettings);
+      applySettingsToForm(envelope.settings);
       await evaluateModels();
       await refreshSubtitleActivity();
       setInterval(refreshSubtitleActivity, 1000);

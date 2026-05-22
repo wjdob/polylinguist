@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
+import shutil
 
 from polylinguist.config import AppConfig, AppPaths
 from polylinguist.schemas import AddonSettings
@@ -21,6 +23,7 @@ from polylinguist.services.subtitles import (
 from polylinguist.services.subtitle_jobs import SubtitleGenerationTracker
 from polylinguist.services.system_profile import SystemProfileService
 from polylinguist.services.translation import TranslationManager, TranslationRequest
+from polylinguist.services.local_models import local_model_artifact_dir
 
 
 SUBTITLE_RENDER_VERSION = "3"
@@ -228,11 +231,110 @@ class AppServices:
         self._subtitle_generation_tasks[cache_key] = task
         return task
 
+    def remove_model_installation(self, provider: str, model_id: str, processing_device: str) -> dict[str, object]:
+        normalized = (processing_device or "auto").lower()
+        removed_paths: list[str] = []
+        notes: list[str] = []
+
+        self.translation_manager.forget_model(provider, model_id, normalized)
+
+        if provider == "marian" and normalized in {"directml", "openvino_gpu"}:
+            artifact_dir = local_model_artifact_dir(self.paths.model_artifacts_dir, provider, model_id, normalized)
+            if artifact_dir.exists():
+                self._remove_tree(artifact_dir)
+                removed_paths.append(str(artifact_dir))
+            self.model_registry.mark_removed(provider, model_id, target=normalized)
+            detail = f"Removed Polylinguist-managed Marian {normalized} artifacts for {model_id}."
+        elif provider == "marian":
+            self.model_registry.mark_removed(provider, model_id)
+            detail = f"Removed {model_id} from Polylinguist's Marian install list for CPU/CUDA use."
+            notes.append("Shared Hugging Face model cache was left in place because it may be used by other tools on this machine.")
+        elif provider == "nllb":
+            self.model_registry.mark_removed(provider, model_id)
+            self.translation_manager.forget_model(provider, model_id, "cpu")
+            self.translation_manager.forget_model(provider, model_id, "cuda")
+            detail = f"Removed {model_id} from Polylinguist's NLLB install list."
+            notes.append("Shared Hugging Face model cache was left in place because it may be used by other tools on this machine.")
+        elif provider == "argos":
+            self.model_registry.mark_removed(provider, model_id)
+            detail = f"Removed {model_id} from Polylinguist's Argos install list."
+            notes.append("Shared Argos package data was left in place to avoid deleting translations used outside Polylinguist.")
+        else:
+            self.model_registry.mark_removed(provider, model_id, target=normalized if normalized != "auto" else None)
+            detail = f"Removed {provider}:{model_id} from Polylinguist's install list."
+
+        self._clear_selected_model_if_matches(provider, model_id, normalized)
+        self._reset_subtitle_runtime_state()
+        self.subtitle_cache.clear()
+        return {
+            "detail": detail,
+            "removed_paths": removed_paths,
+            "notes": notes,
+        }
+
+    def uninstall_local_data(self) -> dict[str, object]:
+        removed_paths: list[str] = []
+        notes = [
+            "Shared Hugging Face and Argos caches were left in place to avoid deleting data used by other tools on this machine.",
+            "Polylinguist's Python package or executable is still installed. Stop the service and uninstall that runtime separately if you want a full system-level uninstall.",
+        ]
+
+        self._reset_subtitle_runtime_state()
+        self.translation_manager.clear_runtime_state()
+        self.model_registry.clear()
+
+        for path in [self.paths.cache_dir, self.paths.model_artifacts_dir]:
+            if path.exists():
+                self._remove_tree(path)
+                removed_paths.append(str(path))
+
+        for file_path in [self.paths.settings_file, self.paths.installed_models_file, self.paths.metadata_cache_file]:
+            if file_path.exists():
+                file_path.unlink()
+                removed_paths.append(str(file_path))
+
+        self.paths.ensure()
+        return {
+            "detail": "Removed Polylinguist local data and reset the service to first-run defaults.",
+            "removed_paths": removed_paths,
+            "notes": notes,
+        }
+
     @staticmethod
     def _display_lang(settings: AddonSettings) -> str:
         if settings.format_mode == "translated_only":
             return settings.target_lang
         return f"{settings.source_lang}+{settings.target_lang}"
+
+    def _clear_selected_model_if_matches(self, provider: str, model_id: str, normalized_target: str) -> None:
+        envelope = self.settings_store.load()
+        settings = envelope.settings
+        if settings.preferred_provider != provider or settings.selected_model_id != model_id:
+            return
+        if normalized_target in {"auto", "cpu", "cuda"}:
+            if settings.processing_device not in {"auto", "cpu", "cuda"}:
+                return
+        elif settings.processing_device != normalized_target:
+            return
+        self.settings_store.save(
+            settings.model_copy(
+                update={
+                    "preferred_provider": "auto",
+                    "selected_model_id": None,
+                }
+            )
+        )
+
+    def _reset_subtitle_runtime_state(self) -> None:
+        for cache_key, task in list(self._subtitle_generation_tasks.items()):
+            if not task.done():
+                task.cancel()
+            self._subtitle_generation_tasks.pop(cache_key, None)
+        self.subtitle_generation_tracker.clear()
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        shutil.rmtree(path)
 
 
 def create_services(paths: AppPaths | None = None, config: AppConfig | None = None) -> AppServices:

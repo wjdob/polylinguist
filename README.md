@@ -132,6 +132,7 @@ The configurator now shows:
 - detected accelerators and supported processing targets
 - model-supported targets per language pair
 - target-specific install buttons
+- target-specific remove buttons for installed models
 - live model install logs
 - live subtitle translation progress
 
@@ -285,3 +286,33 @@ model work:
 ```powershell
 $env:POLYLINGUIST_PYTHON = "C:\Path\To\python.exe"
 ```
+
+## Cleanup and uninstall
+
+To remove a specific installed model target from Polylinguist, use the
+`Remove ...` button in the configurator's `Model Options` section.
+
+To remove Polylinguist local settings, cache, and Polylinguist-managed model
+artifacts from the terminal:
+
+```powershell
+python -m polylinguist.uninstall
+```
+
+Or, after reinstalling the package entrypoints:
+
+```powershell
+polylinguist-uninstall
+```
+
+To skip the confirmation prompt:
+
+```powershell
+python -m polylinguist.uninstall --yes
+```
+
+Notes:
+
+- shared Hugging Face and Argos caches are left in place
+- the uninstall command resets Polylinguist's local data, but it does not
+  uninstall the Python package or executable itself

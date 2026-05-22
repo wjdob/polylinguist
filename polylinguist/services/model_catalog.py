@@ -416,16 +416,24 @@ class ModelCatalogService:
 
     def _installed_targets_for_marian(self, model_id: str) -> tuple[str, ...]:
         installed = set(self.registry.installed_targets("marian", model_id))
-        if self.registry.is_installed("marian", model_id) or hf_model_cache_exists(model_id):
+        if not self.registry.is_removed("marian", model_id) and (
+            self.registry.is_installed("marian", model_id) or hf_model_cache_exists(model_id)
+        ):
             installed.update({"cpu", "cuda"})
-        if local_model_artifact_exists(self.model_artifacts_dir, "marian", model_id, "directml"):
+        if not self.registry.is_removed("marian", model_id, "directml") and local_model_artifact_exists(
+            self.model_artifacts_dir, "marian", model_id, "directml"
+        ):
             installed.add("directml")
-        if local_model_artifact_exists(self.model_artifacts_dir, "marian", model_id, "openvino_gpu"):
+        if not self.registry.is_removed("marian", model_id, "openvino_gpu") and local_model_artifact_exists(
+            self.model_artifacts_dir, "marian", model_id, "openvino_gpu"
+        ):
             installed.add("openvino_gpu")
         return tuple(sorted(installed))
 
     def _installed_targets_for_nllb(self, model_id: str) -> tuple[str, ...]:
         installed = set(self.registry.installed_targets("nllb", model_id))
-        if self.registry.is_installed("nllb", model_id) or hf_model_cache_exists(model_id):
+        if not self.registry.is_removed("nllb", model_id) and (
+            self.registry.is_installed("nllb", model_id) or hf_model_cache_exists(model_id)
+        ):
             installed.update({"cpu", "cuda"})
         return tuple(sorted(installed))

@@ -1,11 +1,14 @@
+import os
 import sys
 
 from polylinguist.services.translation import (
     _discover_python_executables,
     _ensure_python_packages,
+    _configure_huggingface_windows_cache,
     _module_name_for_package,
     _resolve_device_preference,
     _resolve_runtime,
+    _wrap_huggingface_windows_privilege_error,
     TranslationError,
 )
 
@@ -86,3 +89,25 @@ def test_device_preference_rejects_missing_directml(monkeypatch):
         assert "DirectML is not available" in str(exc)
     else:
         raise AssertionError("Expected TranslationError when DirectML is unavailable.")
+
+
+def test_huggingface_windows_cache_sets_no_symlink_mode(monkeypatch):
+    monkeypatch.setattr("polylinguist.services.translation.platform.system", lambda: "Windows")
+    monkeypatch.delenv("HF_HUB_DISABLE_SYMLINKS", raising=False)
+
+    _configure_huggingface_windows_cache()
+
+    assert os.environ["HF_HUB_DISABLE_SYMLINKS"] == "1"
+
+
+def test_huggingface_windows_privilege_error_is_rewritten():
+    exc = OSError("symlink failure")
+    exc.winerror = 1314  # type: ignore[attr-defined]
+
+    try:
+        _wrap_huggingface_windows_privilege_error(exc)
+    except TranslationError as translated:
+        assert "WinError 1314" in str(translated)
+        assert "no-symlink cache mode" in str(translated)
+    else:
+        raise AssertionError("Expected TranslationError for WinError 1314.")

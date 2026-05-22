@@ -42,14 +42,14 @@ Create a virtual environment and install the app:
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e .[dev]
+python -m pip install -e .[dev]
 ```
 
 If you want to preinstall model runtimes up front instead of letting Polylinguist
 bootstrap them on demand:
 
 ```powershell
-pip install -e .[models,system]
+python -m pip install -e .[models,system]
 ```
 
 That optional install includes:
@@ -63,15 +63,22 @@ That optional install includes:
 
 ## Run
 
-The simplest way to run the sidecar is:
+The most reliable way to run the sidecar is:
 
 ```powershell
-polylinguist
+python -m polylinguist
 ```
 
 That starts the local addon on:
 
 - `http://127.0.0.1:8000/configure`
+
+If you prefer the console script form, this also works after installation when
+your Python `Scripts` directory is on `PATH`:
+
+```powershell
+polylinguist
+```
 
 For development with explicit uvicorn control:
 
@@ -98,6 +105,8 @@ Notes:
   already has the needed packages installed.
 - If required packages are missing, Polylinguist can install them on demand.
 - The configurator shows install progress and recent subtitle generation jobs.
+- If `polylinguist` is not recognized as a command, use `python -m polylinguist`
+  from the repo root instead.
 
 ## Using it in Stremio
 

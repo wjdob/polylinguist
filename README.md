@@ -1,5 +1,17 @@
 # Polylinguist
 
+<table>
+  <tr>
+    <td width="48%">
+      <img src="docs/screenshots/UI1.png" alt="Polylinguist configurator" width="100%">
+    </td>
+    <td width="4%"></td>
+    <td width="48%">
+      <img src="docs/screenshots/UI2.png" alt="Polylinguist translation activity" width="100%">
+    </td>
+  </tr>
+</table>
+
 Polylinguist is a desktop-only local Stremio subtitle addon. It runs as a
 FastAPI sidecar on `127.0.0.1`, fetches a primary subtitle candidate, translates
 it with a user-selected local model backend, and serves translated or dual
@@ -32,7 +44,7 @@ out of scope for the initial release.
 
 Optional:
 
-- NVIDIA CUDA-capable GPU for MarianMT GPU runs
+- NVIDIA CUDA-capable GPU for MarianMT and NLLB-200 GPU runs
 - extra free disk space for model downloads and subtitle cache
 
 ## Install

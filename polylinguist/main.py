@@ -4,11 +4,13 @@ import os
 import socket
 
 import uvicorn
+from polylinguist.config import AppConfig
 
 
 def main() -> None:
-    host = os.getenv("POLYLINGUIST_HOST", "127.0.0.1")
-    requested_port = int(os.getenv("POLYLINGUIST_PORT", "8000"))
+    config = AppConfig.detect()
+    host = config.bind_host
+    requested_port = config.bind_port
     port = _find_available_port(host, requested_port)
     print(f"Starting Polylinguist on http://{host}:{port}/configure")
     uvicorn.run("polylinguist.app:create_app", factory=True, host=host, port=port, reload=False)

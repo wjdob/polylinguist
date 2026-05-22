@@ -2,12 +2,12 @@ from pathlib import Path
 
 from polylinguist.services.model_catalog import ModelCatalogService
 from polylinguist.services.model_registry import InstalledModelRegistry
-from polylinguist.services.system_profile import SystemProfile
+from polylinguist.services.system_profile import AcceleratorInfo, SystemProfile
 
 
 def make_catalog(tmp_path: Path) -> ModelCatalogService:
     registry = InstalledModelRegistry(tmp_path / "installed.json")
-    return ModelCatalogService(tmp_path / "meta.json", registry)
+    return ModelCatalogService(tmp_path / "meta.json", registry, tmp_path / "models")
 
 
 def test_argos_direct_pair(monkeypatch, tmp_path: Path):
@@ -43,6 +43,8 @@ def test_marian_and_nllb_availability(monkeypatch, tmp_path: Path):
     nllb = next(model for model in response.models if model.provider == "nllb")
     assert marian.available is True
     assert nllb.available is True
+    assert "cpu" in marian.supported_targets
+    assert "cuda" not in marian.supported_targets
 
 
 def test_marian_english_polish_falls_back_to_en_ine(monkeypatch, tmp_path: Path):
@@ -59,6 +61,7 @@ def test_marian_english_polish_falls_back_to_en_ine(monkeypatch, tmp_path: Path)
     assert marian.available is True
     assert marian.model_id == "Helsinki-NLP/opus-mt-en-ine"
     assert marian.direct is False
+    assert "cuda" in marian.supported_targets
 
 
 def test_marian_english_turkish_falls_back_to_en_trk(monkeypatch, tmp_path: Path):
@@ -84,3 +87,27 @@ def test_low_machine_prefers_argos(monkeypatch, tmp_path: Path):
     profile = SystemProfile("windows", "amd64", 2, 4.0, 10.0, False, False)
     response = catalog.list_models("eng", "spa", profile)
     assert response.recommended_provider == "argos"
+
+
+def test_marian_exposes_directml_and_openvino_targets(monkeypatch, tmp_path: Path):
+    catalog = make_catalog(tmp_path)
+    monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {})
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: True)
+    profile = SystemProfile(
+        "windows",
+        "amd64",
+        8,
+        16.0,
+        20.0,
+        False,
+        False,
+        accelerators=(
+            AcceleratorInfo(vendor="amd", name="Radeon RX", supported_targets=("directml",)),
+            AcceleratorInfo(vendor="intel", name="Arc A750", supported_targets=("openvino_gpu",)),
+        ),
+    )
+    response = catalog.list_models("eng", "spa", profile)
+    marian = next(model for model in response.models if model.provider == "marian")
+    assert "directml" in marian.supported_targets
+    assert "openvino_gpu" in marian.supported_targets
+    assert marian.recommended_target == "openvino_gpu"

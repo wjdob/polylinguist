@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import platform
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Iterable
 
-from polylinguist.schemas import SystemProfileResponse
+from polylinguist.schemas import AcceleratorResponse, SystemProfileResponse
+
+
+@dataclass(frozen=True)
+class AcceleratorInfo:
+    vendor: str
+    name: str
+    supported_targets: tuple[str, ...] = ()
+
+    def to_response(self) -> AcceleratorResponse:
+        return AcceleratorResponse(
+            vendor=self.vendor,
+            name=self.name,
+            supported_targets=list(self.supported_targets),
+        )
 
 
 @dataclass(frozen=True)
@@ -19,14 +35,33 @@ class SystemProfile:
     free_disk_gb: float
     has_cuda: bool
     has_mps: bool
+    accelerators: tuple[AcceleratorInfo, ...] = field(default_factory=tuple)
 
     @property
     def tier(self) -> str:
         if self.total_ram_gb < 8 or self.cpu_cores < 4 or self.free_disk_gb < 8:
             return "low"
-        if self.total_ram_gb >= 16 and (self.has_cuda or self.has_mps or self.cpu_cores >= 8):
+        if self.total_ram_gb >= 16 and (self.has_cuda or self.has_mps or self.has_any_acceleration or self.cpu_cores >= 8):
             return "strong"
         return "standard"
+
+    @property
+    def has_any_acceleration(self) -> bool:
+        return any(accelerator.supported_targets for accelerator in self.accelerators)
+
+    def supports_target(self, target: str) -> bool:
+        normalized = (target or "").lower()
+        if normalized == "cpu":
+            return True
+        if normalized == "cuda":
+            return self.has_cuda
+        if normalized == "mps":
+            return self.has_mps
+        return any(normalized in accelerator.supported_targets for accelerator in self.accelerators)
+
+    def accelerators_for_target(self, target: str) -> list[AcceleratorInfo]:
+        normalized = (target or "").lower()
+        return [item for item in self.accelerators if normalized in item.supported_targets]
 
     def to_response(self) -> SystemProfileResponse:
         return SystemProfileResponse(
@@ -37,21 +72,77 @@ class SystemProfile:
             free_disk_gb=round(self.free_disk_gb, 2),
             has_cuda=self.has_cuda,
             has_mps=self.has_mps,
+            accelerators=[item.to_response() for item in self.accelerators],
             tier=self.tier,
         )
 
 
 class SystemProfileService:
     def detect(self) -> SystemProfile:
+        system = platform.system().lower()
+        accelerators = tuple(_detect_accelerators(system))
+        has_cuda = any("cuda" in accelerator.supported_targets for accelerator in accelerators) or _detect_cuda()
+        has_mps = _detect_mps()
         return SystemProfile(
-            os=platform.system().lower(),
+            os=system,
             arch=platform.machine().lower(),
             cpu_cores=os.cpu_count() or 1,
             total_ram_gb=_detect_total_ram_gb(),
             free_disk_gb=_detect_free_disk_gb(),
-            has_cuda=_detect_cuda(),
-            has_mps=_detect_mps(),
+            has_cuda=has_cuda,
+            has_mps=has_mps,
+            accelerators=accelerators,
         )
+
+
+def _detect_accelerators(system: str) -> Iterable[AcceleratorInfo]:
+    accelerators: list[AcceleratorInfo] = []
+
+    nvidia_names = _detect_nvidia_gpu_names()
+    for name in nvidia_names:
+        accelerators.append(AcceleratorInfo(vendor="nvidia", name=name, supported_targets=("cuda",)))
+
+    if system == "windows":
+        adapters = _detect_windows_video_adapters()
+        if _directml_runtime_ready():
+            for adapter in adapters:
+                if adapter.vendor == "amd":
+                    accelerators.append(
+                        AcceleratorInfo(
+                            vendor="amd",
+                            name=adapter.name,
+                            supported_targets=("directml",),
+                        )
+                    )
+        if _openvino_gpu_ready():
+            for adapter in adapters:
+                if adapter.vendor == "intel":
+                    accelerators.append(
+                        AcceleratorInfo(
+                            vendor="intel",
+                            name=adapter.name,
+                            supported_targets=("openvino_gpu",),
+                        )
+                    )
+    return _dedupe_accelerators(accelerators)
+
+
+@dataclass(frozen=True)
+class _VideoAdapter:
+    vendor: str
+    name: str
+
+
+def _dedupe_accelerators(items: Iterable[AcceleratorInfo]) -> tuple[AcceleratorInfo, ...]:
+    deduped: dict[tuple[str, str], AcceleratorInfo] = {}
+    for item in items:
+        key = (item.vendor, item.name)
+        if key in deduped:
+            merged_targets = tuple(sorted(set(deduped[key].supported_targets) | set(item.supported_targets)))
+            deduped[key] = AcceleratorInfo(vendor=item.vendor, name=item.name, supported_targets=merged_targets)
+        else:
+            deduped[key] = item
+    return tuple(deduped.values())
 
 
 def _detect_total_ram_gb() -> float:
@@ -106,7 +197,10 @@ def _detect_cuda() -> bool:
             return True
     except Exception:
         pass
+    return bool(_detect_nvidia_gpu_names())
 
+
+def _detect_nvidia_gpu_names() -> list[str]:
     try:
         completed = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -115,9 +209,9 @@ def _detect_cuda() -> bool:
             text=True,
             timeout=10,
         )
-        return bool(completed.stdout.strip())
+        return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
     except Exception:
-        return False
+        return []
 
 
 def _detect_mps() -> bool:
@@ -125,5 +219,73 @@ def _detect_mps() -> bool:
         import torch  # type: ignore
 
         return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    except Exception:
+        return False
+
+
+def _detect_windows_video_adapters() -> list[_VideoAdapter]:
+    command = (
+        "Get-CimInstance Win32_VideoController | "
+        "Select-Object Name,AdapterCompatibility | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        payload = json.loads(completed.stdout.strip() or "[]")
+    except Exception:
+        return []
+
+    if isinstance(payload, dict):
+        payload = [payload]
+    adapters: list[_VideoAdapter] = []
+    for item in payload or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "").strip()
+        compat = str(item.get("AdapterCompatibility") or "").strip()
+        vendor = _normalize_vendor(" ".join([compat, name]))
+        if name and vendor:
+            adapters.append(_VideoAdapter(vendor=vendor, name=name))
+    return adapters
+
+
+def _normalize_vendor(value: str) -> str | None:
+    lowered = value.lower()
+    if "nvidia" in lowered:
+        return "nvidia"
+    if "advanced micro devices" in lowered or " amd" in lowered or lowered.startswith("amd") or " ati" in lowered:
+        return "amd"
+    if "intel" in lowered:
+        return "intel"
+    if "apple" in lowered:
+        return "apple"
+    return None
+
+
+def _directml_runtime_ready() -> bool:
+    if platform.system().lower() != "windows":
+        return False
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        providers = {provider.lower() for provider in ort.get_available_providers()}
+        return "dmlexecutionprovider" in providers or "directmlexecutionprovider" in providers
+    except Exception:
+        return False
+
+
+def _openvino_gpu_ready() -> bool:
+    if platform.system().lower() != "windows":
+        return False
+    try:
+        from openvino.runtime import Core  # type: ignore
+
+        core = Core()
+        return any(device.upper().startswith("GPU") for device in core.available_devices)
     except Exception:
         return False

@@ -23,6 +23,13 @@ models = [
     "transformers>=4.51.0",
     "torch>=2.7.0",
 ]
+windows-gpu = [
+    "onnx>=1.17.0",
+    "onnxruntime-directml>=1.20.0",
+    "openvino>=2024.6.0",
+    "optimum>=1.23.0",
+    "optimum-intel>=1.21.0",
+]
 system = [
     "psutil>=6.0.0",
 ]

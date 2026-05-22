@@ -112,6 +112,15 @@ def benchmark_hf(
     target_nllb: str | None,
     cues: list[str],
 ) -> dict[str, Any]:
+    if args.device == "directml":
+        if args.provider != "marian":
+            raise SystemExit("DirectML benchmark mode is only supported for MarianMT.")
+        return benchmark_marian_directml(args, cues)
+    if args.device == "openvino_gpu":
+        if args.provider != "marian":
+            raise SystemExit("OpenVINO GPU benchmark mode is only supported for MarianMT.")
+        return benchmark_marian_openvino(args, cues)
+
     setup_started = time.perf_counter()
     import torch  # type: ignore
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
@@ -182,6 +191,82 @@ def benchmark_hf(
     }
 
 
+def benchmark_marian_directml(args: argparse.Namespace, cues: list[str]) -> dict[str, Any]:
+    from optimum.onnxruntime import ORTModelForSeq2SeqLM  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
+
+    setup_started = time.perf_counter()
+    model_id = args.model_id or "Helsinki-NLP/opus-mt-en-ine"
+    setup_seconds = time.perf_counter() - setup_started
+
+    load_started = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = ORTModelForSeq2SeqLM.from_pretrained(model_id, export=True, provider="DmlExecutionProvider")
+    load_seconds = time.perf_counter() - load_started
+
+    translate_started = time.perf_counter()
+    target_token = resolve_marian_target_token(args, model_id)
+    translations: list[str] = []
+    for start in range(0, len(cues), args.batch_size):
+        batch = cues[start : start + args.batch_size]
+        if target_token:
+            batch = [f">>{target_token}<< {item}" for item in batch]
+        encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+        generated = model.generate(**encoded, max_new_tokens=args.max_new_tokens)
+        translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    translation_seconds = time.perf_counter() - translate_started
+    return {
+        "model": model_id,
+        "effective_device": "directml",
+        "dtype": "default",
+        "setup_seconds": setup_seconds,
+        "load_seconds": load_seconds,
+        "translation_seconds": translation_seconds,
+        "gpu_memory_mb": None,
+        "sample_output": translations[:3],
+        "target_token": target_token,
+    }
+
+
+def benchmark_marian_openvino(args: argparse.Namespace, cues: list[str]) -> dict[str, Any]:
+    from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
+
+    setup_started = time.perf_counter()
+    model_id = args.model_id or "Helsinki-NLP/opus-mt-en-ine"
+    setup_seconds = time.perf_counter() - setup_started
+
+    load_started = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True, device="gpu", compile=False)
+    model.to("gpu")
+    model.compile()
+    load_seconds = time.perf_counter() - load_started
+
+    translate_started = time.perf_counter()
+    target_token = resolve_marian_target_token(args, model_id)
+    translations: list[str] = []
+    for start in range(0, len(cues), args.batch_size):
+        batch = cues[start : start + args.batch_size]
+        if target_token:
+            batch = [f">>{target_token}<< {item}" for item in batch]
+        encoded = tokenizer(batch, return_tensors="np", padding=True, truncation=True)
+        generated = model.generate(**encoded, max_new_tokens=args.max_new_tokens)
+        translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    translation_seconds = time.perf_counter() - translate_started
+    return {
+        "model": model_id,
+        "effective_device": "openvino_gpu",
+        "dtype": "default",
+        "setup_seconds": setup_seconds,
+        "load_seconds": load_seconds,
+        "translation_seconds": translation_seconds,
+        "gpu_memory_mb": None,
+        "sample_output": translations[:3],
+        "target_token": target_token,
+    }
+
+
 def resolve_dtype(args: argparse.Namespace, torch_module: Any, device: str) -> Any:
     if args.dtype == "fp32":
         return torch_module.float32
@@ -207,7 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--subtitle", required=True)
     parser.add_argument("--provider", choices=["argos", "marian", "nllb"], required=True)
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--device", choices=["cpu", "cuda", "directml", "openvino_gpu"], default="cpu")
     parser.add_argument("--source-lang", default="eng")
     parser.add_argument("--target-lang", default="pol")
     parser.add_argument("--model-id")

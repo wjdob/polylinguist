@@ -3,30 +3,40 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib.util
 import json
-from pathlib import Path
 import os
+from pathlib import Path
 from queue import Empty, Queue
-import shutil
 import subprocess
 import sys
-from threading import Thread
+from threading import Lock, Thread
 import time
 from typing import Callable
 
 from polylinguist.services.languages import get_language
-from polylinguist.services.local_models import hf_model_cache_exists
+from polylinguist.services.local_models import (
+    hf_model_cache_exists,
+    local_model_artifact_dir,
+    local_model_artifact_exists,
+)
 from polylinguist.services.model_catalog import ModelDescriptor
 from polylinguist.services.model_registry import InstalledModelRegistry
 
 
 PACKAGE_MODULES = {
+    "argostranslate": "argostranslate",
     "huggingface-hub": "huggingface_hub",
+    "onnx": "onnx",
+    "onnxruntime": "onnxruntime",
+    "onnxruntime-directml": "onnxruntime",
+    "openvino": "openvino",
+    "optimum": "optimum.onnxruntime",
+    "optimum-intel": "optimum.intel",
     "sentencepiece": "sentencepiece",
     "torch": "torch",
     "transformers": "transformers",
-    "argostranslate": "argostranslate",
 }
 
+MARIAN_BATCH_SIZE = 8
 NLLB_BATCH_SIZE = 16
 
 
@@ -66,16 +76,22 @@ class TranslatorAdapter:
     ) -> str:
         raise NotImplementedError
 
-    def translate_batch(self, request: TranslationRequest, cues: list[str], progress: ProgressCallback | None = None) -> list[str]:
+    def translate_batch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
         raise NotImplementedError
 
 
 class TranslationManager:
-    def __init__(self, registry: InstalledModelRegistry) -> None:
+    def __init__(self, registry: InstalledModelRegistry, model_artifacts_dir: Path) -> None:
         self.registry = registry
+        self.model_artifacts_dir = model_artifacts_dir
         self.adapters: dict[str, TranslatorAdapter] = {
             "argos": ArgosTranslator(registry),
-            "marian": MarianTranslator(registry),
+            "marian": MarianTranslator(registry, model_artifacts_dir),
             "nllb": NllbTranslator(registry),
         }
 
@@ -88,16 +104,41 @@ class TranslationManager:
         adapter = self.adapters[descriptor.provider]
         return adapter.install(descriptor, progress, device_preference)
 
-    def is_installed(self, provider: str, model_id: str) -> bool:
-        if self.registry.is_installed(provider, model_id):
-            return True
-        if provider in {"marian", "nllb"}:
-            return hf_model_cache_exists(model_id)
-        return False
+    def is_installed(self, provider: str, model_id: str, device_preference: str = "auto") -> bool:
+        normalized = _normalize_device_preference(device_preference)
+        if provider == "argos":
+            return self.registry.is_installed(provider, model_id)
+        if provider == "marian":
+            if normalized == "auto":
+                return (
+                    self.registry.is_installed(provider, model_id)
+                    or self.registry.is_installed(provider, model_id, "directml")
+                    or self.registry.is_installed(provider, model_id, "openvino_gpu")
+                    or hf_model_cache_exists(model_id)
+                    or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "directml")
+                    or local_model_artifact_exists(self.model_artifacts_dir, provider, model_id, "openvino_gpu")
+                )
+            if normalized in {"directml", "openvino_gpu"}:
+                return self.registry.is_installed(provider, model_id, normalized) or local_model_artifact_exists(
+                    self.model_artifacts_dir, provider, model_id, normalized
+                )
+            return self.registry.is_installed(provider, model_id) or hf_model_cache_exists(model_id)
+        if provider == "nllb":
+            if normalized in {"directml", "openvino_gpu"}:
+                return False
+            return self.registry.is_installed(provider, model_id) or hf_model_cache_exists(model_id)
+        return self.registry.is_installed(provider, model_id)
 
-    def translate_batch(self, request: TranslationRequest, cues: list[str], progress: ProgressCallback | None = None) -> list[str]:
-        if not self.is_installed(request.provider, request.model_id):
-            raise TranslationError(f"Model {request.provider}:{request.model_id} is not installed.")
+    def translate_batch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
+        if not self.is_installed(request.provider, request.model_id, request.device_preference):
+            raise TranslationError(
+                f"Model {request.provider}:{request.model_id} is not installed for {request.device_preference}."
+            )
         adapter = self.adapters[request.provider]
         return adapter.translate_batch(request, cues, progress)
 
@@ -139,10 +180,15 @@ class ArgosTranslator(TranslatorAdapter):
         )
         return detail
 
-    def translate_batch(self, request: TranslationRequest, cues: list[str], progress: ProgressCallback | None = None) -> list[str]:
+    def translate_batch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
-        if request.device_preference == "cuda":
+        if request.device_preference not in {"auto", "cpu"}:
             _notify(progress, "runtime", "Argos Translate is CPU-only. Falling back to CPU execution.")
         if _same_executable(runtime_executable, sys.executable):
             _notify(progress, "runtime", "Using Argos in the active Python runtime.")
@@ -166,8 +212,9 @@ class ArgosTranslator(TranslatorAdapter):
 class MarianTranslator(TranslatorAdapter):
     provider = "marian"
 
-    def __init__(self, registry: InstalledModelRegistry) -> None:
+    def __init__(self, registry: InstalledModelRegistry, model_artifacts_dir: Path) -> None:
         self.registry = registry
+        self.model_artifacts_dir = model_artifacts_dir
         self._bundles: dict[tuple[str, str], dict[str, object]] = {}
 
     def install(
@@ -176,7 +223,62 @@ class MarianTranslator(TranslatorAdapter):
         progress: ProgressCallback | None = None,
         device_preference: str = "auto",
     ) -> str:
-        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=device_preference == "cuda")
+        target = _normalize_device_preference(device_preference)
+        if target == "auto":
+            target = descriptor.recommended_target or "cpu"
+        if target == "directml":
+            runtime = _resolve_runtime(_ort_runtime_packages())
+            artifact_dir = self._artifact_dir(descriptor.model_id, "directml")
+            _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
+            if runtime.current:
+                _ensure_python_packages(_ort_runtime_packages(), "MarianMT DirectML", progress)
+                detail = _install_marian_directml_current(descriptor.model_id, artifact_dir, progress)
+            else:
+                detail = _run_worker(
+                    runtime.executable,
+                    "install-marian-directml",
+                    {"model_id": descriptor.model_id, "artifact_dir": str(artifact_dir)},
+                    progress=progress,
+                )
+            self.registry.mark_installed(
+                self.provider,
+                descriptor.model_id,
+                {
+                    "python_executable": runtime.executable,
+                    "detail": detail,
+                    "artifact_dir": str(artifact_dir),
+                },
+                target="directml",
+            )
+            return detail
+
+        if target == "openvino_gpu":
+            runtime = _resolve_runtime(_openvino_runtime_packages())
+            artifact_dir = self._artifact_dir(descriptor.model_id, "openvino_gpu")
+            _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
+            if runtime.current:
+                _ensure_python_packages(_openvino_runtime_packages(), "MarianMT OpenVINO", progress)
+                detail = _install_marian_openvino_current(descriptor.model_id, artifact_dir, progress)
+            else:
+                detail = _run_worker(
+                    runtime.executable,
+                    "install-marian-openvino",
+                    {"model_id": descriptor.model_id, "artifact_dir": str(artifact_dir)},
+                    progress=progress,
+                )
+            self.registry.mark_installed(
+                self.provider,
+                descriptor.model_id,
+                {
+                    "python_executable": runtime.executable,
+                    "detail": detail,
+                    "artifact_dir": str(artifact_dir),
+                },
+                target="openvino_gpu",
+            )
+            return detail
+
+        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=target == "cuda")
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
             _ensure_python_packages(_hf_runtime_packages(), "MarianMT", progress)
@@ -185,9 +287,7 @@ class MarianTranslator(TranslatorAdapter):
             detail = _run_worker(
                 runtime.executable,
                 "install-hf",
-                {
-                    "model_id": descriptor.model_id,
-                },
+                {"model_id": descriptor.model_id},
                 progress=progress,
             )
         self.registry.mark_installed(
@@ -200,7 +300,25 @@ class MarianTranslator(TranslatorAdapter):
         )
         return detail
 
-    def translate_batch(self, request: TranslationRequest, cues: list[str], progress: ProgressCallback | None = None) -> list[str]:
+    def translate_batch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
+        target = self._effective_target(request.device_preference, request.model_id)
+        if target == "directml":
+            return self._translate_directml(request, cues, progress)
+        if target == "openvino_gpu":
+            return self._translate_openvino(request, cues, progress)
+        return self._translate_torch(request, cues, progress)
+
+    def _translate_torch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
         if request.device_preference == "cuda" and not _python_runtime_has_cuda(runtime_executable):
@@ -210,13 +328,13 @@ class MarianTranslator(TranslatorAdapter):
         if _same_executable(runtime_executable, sys.executable):
             _notify(progress, "runtime", "Using MarianMT in the active Python runtime.")
             _ensure_python_packages(_hf_runtime_packages(), "MarianMT")
-            return self._translate_current(
-                request.model_id,
-                request.target_lang,
-                cues,
-                request.device_preference,
-                progress,
-            )
+            normalized = _normalize_device_preference(request.device_preference)
+            device = _resolve_device_preference("cuda", progress) if normalized == "cuda" else "cpu"
+            if normalized == "auto" and _current_runtime_has_cuda():
+                device = "cuda"
+            bundle = self._get_torch_bundle(request.model_id, device, progress)
+            prepared = _prepare_marian_batch(request.model_id, request.target_lang, cues)
+            return _translate_torch_seq2seq_bundle(bundle, prepared, progress)
         _notify(progress, "runtime", f"Using MarianMT worker runtime: {runtime_executable}")
         return _run_worker(
             runtime_executable,
@@ -230,23 +348,94 @@ class MarianTranslator(TranslatorAdapter):
             progress=progress,
         )
 
-    def _translate_current(
+    def _translate_directml(
         self,
-        model_id: str,
-        target_lang: str,
+        request: TranslationRequest,
         cues: list[str],
-        device_preference: str,
         progress: ProgressCallback | None = None,
     ) -> list[str]:
-        device = _resolve_device_preference(device_preference, progress)
-        bundle = self._get_bundle(model_id, device, progress)
-        return _translate_seq2seq_bundle(bundle, _prepare_marian_batch(model_id, target_lang, cues), progress)
+        metadata = self.registry.metadata_for(self.provider, request.model_id, "directml") or {}
+        artifact_dir = Path(metadata.get("artifact_dir") or self._artifact_dir(request.model_id, "directml"))
+        runtime_executable = metadata.get("python_executable", sys.executable)
+        if not artifact_dir.exists():
+            raise TranslationError("Marian DirectML artifacts are not installed for this model.")
+        if _same_executable(runtime_executable, sys.executable):
+            _notify(progress, "runtime", "Using MarianMT DirectML in the active Python runtime.")
+            _ensure_python_packages(_ort_runtime_packages(), "MarianMT DirectML")
+            bundle = self._get_directml_bundle(artifact_dir, progress)
+            prepared = _prepare_marian_batch(request.model_id, request.target_lang, cues)
+            return _translate_ort_seq2seq_bundle(bundle, prepared, progress)
+        _notify(progress, "runtime", f"Using MarianMT DirectML worker runtime: {runtime_executable}")
+        return _run_worker(
+            runtime_executable,
+            "translate-marian-directml",
+            {
+                "artifact_dir": str(artifact_dir),
+                "model_id": request.model_id,
+                "target_lang": request.target_lang,
+                "cues": cues,
+            },
+            progress=progress,
+        )
 
-    def _get_bundle(self, model_id: str, device: str, progress: ProgressCallback | None = None) -> dict[str, object]:
+    def _translate_openvino(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
+        metadata = self.registry.metadata_for(self.provider, request.model_id, "openvino_gpu") or {}
+        artifact_dir = Path(metadata.get("artifact_dir") or self._artifact_dir(request.model_id, "openvino_gpu"))
+        runtime_executable = metadata.get("python_executable", sys.executable)
+        if not artifact_dir.exists():
+            raise TranslationError("Marian OpenVINO artifacts are not installed for this model.")
+        if _same_executable(runtime_executable, sys.executable):
+            _notify(progress, "runtime", "Using MarianMT OpenVINO GPU in the active Python runtime.")
+            _ensure_python_packages(_openvino_runtime_packages(), "MarianMT OpenVINO")
+            bundle = self._get_openvino_bundle(artifact_dir, progress)
+            prepared = _prepare_marian_batch(request.model_id, request.target_lang, cues)
+            return _translate_openvino_seq2seq_bundle(bundle, prepared, progress)
+        _notify(progress, "runtime", f"Using MarianMT OpenVINO worker runtime: {runtime_executable}")
+        return _run_worker(
+            runtime_executable,
+            "translate-marian-openvino",
+            {
+                "artifact_dir": str(artifact_dir),
+                "model_id": request.model_id,
+                "target_lang": request.target_lang,
+                "cues": cues,
+            },
+            progress=progress,
+        )
+
+    def _artifact_dir(self, model_id: str, target: str) -> Path:
+        return local_model_artifact_dir(self.model_artifacts_dir, self.provider, model_id, target)
+
+    def _effective_target(self, requested_target: str, model_id: str) -> str:
+        normalized = _normalize_device_preference(requested_target)
+        if normalized != "auto":
+            return normalized
+        if _current_runtime_has_cuda():
+            return "cuda"
+        if self.registry.is_installed(self.provider, model_id, "openvino_gpu") or local_model_artifact_exists(
+            self.model_artifacts_dir, self.provider, model_id, "openvino_gpu"
+        ):
+            return "openvino_gpu"
+        if self.registry.is_installed(self.provider, model_id, "directml") or local_model_artifact_exists(
+            self.model_artifacts_dir, self.provider, model_id, "directml"
+        ):
+            return "directml"
+        return "cpu"
+
+    def _get_torch_bundle(
+        self,
+        model_id: str,
+        device: str,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, object]:
         cache_key = (model_id, device)
         if cache_key in self._bundles:
             return self._bundles[cache_key]
-        import torch  # type: ignore
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
 
         _notify(progress, "load", f"Loading tokenizer for {model_id}.")
@@ -257,9 +446,55 @@ class MarianTranslator(TranslatorAdapter):
             model = model.to(device)
         if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
             model.generation_config.max_length = None
-        bundle = {"tokenizer": tokenizer, "model": model, "device": device}
+        bundle = {"tokenizer": tokenizer, "model": model, "device": device, "lock": Lock()}
         self._bundles[cache_key] = bundle
         _notify(progress, "load", f"Model loaded on {device}.")
+        return bundle
+
+    def _get_directml_bundle(
+        self,
+        artifact_dir: Path,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, object]:
+        cache_key = (str(artifact_dir), "directml")
+        if cache_key in self._bundles:
+            return self._bundles[cache_key]
+        from optimum.onnxruntime import ORTModelForSeq2SeqLM  # type: ignore
+        from transformers import AutoTokenizer  # type: ignore
+
+        _notify(progress, "load", f"Loading Marian DirectML artifacts from {artifact_dir}.")
+        tokenizer = AutoTokenizer.from_pretrained(str(artifact_dir))
+        model = ORTModelForSeq2SeqLM.from_pretrained(str(artifact_dir), provider="DmlExecutionProvider")
+        bundle = {"tokenizer": tokenizer, "model": model, "device": "directml", "lock": Lock()}
+        self._bundles[cache_key] = bundle
+        _notify(progress, "load", "DirectML session is ready.")
+        return bundle
+
+    def _get_openvino_bundle(
+        self,
+        artifact_dir: Path,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, object]:
+        cache_key = (str(artifact_dir), "openvino_gpu")
+        if cache_key in self._bundles:
+            return self._bundles[cache_key]
+        from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
+        from transformers import AutoTokenizer  # type: ignore
+
+        _notify(progress, "load", f"Loading Marian OpenVINO artifacts from {artifact_dir}.")
+        tokenizer = AutoTokenizer.from_pretrained(str(artifact_dir))
+        model = OVModelForSeq2SeqLM.from_pretrained(
+            str(artifact_dir),
+            device="gpu",
+            compile=False,
+            ov_config={"CACHE_DIR": str(artifact_dir / "model_cache")},
+        )
+        _notify(progress, "compile", "Compiling OpenVINO GPU graph.")
+        model.to("gpu")
+        model.compile()
+        bundle = {"tokenizer": tokenizer, "model": model, "device": "openvino_gpu", "lock": Lock()}
+        self._bundles[cache_key] = bundle
+        _notify(progress, "load", "OpenVINO GPU model is ready.")
         return bundle
 
 
@@ -276,7 +511,10 @@ class NllbTranslator(TranslatorAdapter):
         progress: ProgressCallback | None = None,
         device_preference: str = "auto",
     ) -> str:
-        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=device_preference == "cuda")
+        target = _normalize_device_preference(device_preference)
+        if target in {"directml", "openvino_gpu"}:
+            raise TranslationError("NLLB is only supported on CPU or CUDA in this release.")
+        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=target == "cuda")
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
             _ensure_python_packages(_hf_runtime_packages(), "NLLB", progress)
@@ -285,9 +523,7 @@ class NllbTranslator(TranslatorAdapter):
             detail = _run_worker(
                 runtime.executable,
                 "install-hf",
-                {
-                    "model_id": descriptor.model_id,
-                },
+                {"model_id": descriptor.model_id},
                 progress=progress,
             )
         self.registry.mark_installed(
@@ -300,7 +536,15 @@ class NllbTranslator(TranslatorAdapter):
         )
         return detail
 
-    def translate_batch(self, request: TranslationRequest, cues: list[str], progress: ProgressCallback | None = None) -> list[str]:
+    def translate_batch(
+        self,
+        request: TranslationRequest,
+        cues: list[str],
+        progress: ProgressCallback | None = None,
+    ) -> list[str]:
+        target = _normalize_device_preference(request.device_preference)
+        if target in {"directml", "openvino_gpu"}:
+            raise TranslationError("NLLB is only supported on CPU or CUDA in this release.")
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
         if request.device_preference == "cuda" and not _python_runtime_has_cuda(runtime_executable):
@@ -310,32 +554,37 @@ class NllbTranslator(TranslatorAdapter):
         if _same_executable(runtime_executable, sys.executable):
             _notify(progress, "runtime", "Using NLLB in the active Python runtime.")
             _ensure_python_packages(_hf_runtime_packages(), "NLLB")
-            device = _resolve_device_preference(request.device_preference, progress)
+            normalized = _normalize_device_preference(request.device_preference)
+            device = _resolve_device_preference("cuda", progress) if normalized == "cuda" else "cpu"
+            if normalized == "auto" and _current_runtime_has_cuda():
+                device = "cuda"
             bundle = self._get_bundle(request.model_id, device, progress)
             source = get_language(request.source_lang)
-            target = get_language(request.target_lang)
-            if not source or not target or not source.nllb_code or not target.nllb_code:
+            target_lang = get_language(request.target_lang)
+            if not source or not target_lang or not source.nllb_code or not target_lang.nllb_code:
                 raise TranslationError("Requested language pair is not available in NLLB.")
             tokenizer = bundle["tokenizer"]
             model = bundle["model"]
-            translations: list[str] = []
-            total_batches = (len(cues) + NLLB_BATCH_SIZE - 1) // NLLB_BATCH_SIZE
-            forced_bos_token_id = tokenizer.convert_tokens_to_ids(target.nllb_code)
+            forced_bos_token_id = tokenizer.convert_tokens_to_ids(target_lang.nllb_code)
             import torch  # type: ignore
 
+            translations: list[str] = []
             model.eval()
-            with torch.no_grad():
-                for batch_index, start in enumerate(range(0, len(cues), NLLB_BATCH_SIZE), start=1):
-                    _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
-                    batch = cues[start : start + NLLB_BATCH_SIZE]
-                    encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
-                    if device != "cpu":
-                        encoded = {key: value.to(device) for key, value in encoded.items()}
-                    generated = model.generate(
-                        **encoded,
-                        forced_bos_token_id=forced_bos_token_id,
-                    )
-                    translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+            lock: Lock = bundle["lock"]  # type: ignore[assignment]
+            with lock:
+                with torch.no_grad():
+                    for batch_index, start in enumerate(range(0, len(cues), NLLB_BATCH_SIZE), start=1):
+                        _notify(
+                            progress,
+                            "translate",
+                            f"Translating batch {batch_index}/{max((len(cues) + NLLB_BATCH_SIZE - 1) // NLLB_BATCH_SIZE, 1)}.",
+                        )
+                        batch = cues[start : start + NLLB_BATCH_SIZE]
+                        encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+                        if device != "cpu":
+                            encoded = {key: value.to(device) for key, value in encoded.items()}
+                        generated = model.generate(**encoded, forced_bos_token_id=forced_bos_token_id)
+                        translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
             return translations
         _notify(progress, "runtime", f"Using NLLB worker runtime: {runtime_executable}")
         return _run_worker(
@@ -365,7 +614,7 @@ class NllbTranslator(TranslatorAdapter):
             model = model.to(device)
         if hasattr(model, "generation_config") and hasattr(model.generation_config, "max_length"):
             model.generation_config.max_length = None
-        bundle = {"tokenizer": tokenizer, "model": model, "device": device}
+        bundle = {"tokenizer": tokenizer, "model": model, "device": device, "lock": Lock()}
         self._bundles[cache_key] = bundle
         _notify(progress, "load", f"Model loaded on {device}.")
         return bundle
@@ -428,7 +677,41 @@ def _install_hf_current(model_id: str, progress: ProgressCallback | None = None)
     return f"Downloaded {model_id} to {location}"
 
 
-def _translate_seq2seq_bundle(
+def _install_marian_directml_current(
+    model_id: str,
+    artifact_dir: Path,
+    progress: ProgressCallback | None = None,
+) -> str:
+    from optimum.onnxruntime import ORTModelForSeq2SeqLM  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    _notify(progress, "download", f"Exporting MarianMT model to DirectML-ready ONNX artifacts for {model_id}.")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = ORTModelForSeq2SeqLM.from_pretrained(model_id, export=True)
+    model.save_pretrained(str(artifact_dir))
+    tokenizer.save_pretrained(str(artifact_dir))
+    return f"Exported DirectML artifacts for {model_id} to {artifact_dir}"
+
+
+def _install_marian_openvino_current(
+    model_id: str,
+    artifact_dir: Path,
+    progress: ProgressCallback | None = None,
+) -> str:
+    from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    _notify(progress, "download", f"Exporting MarianMT model to OpenVINO artifacts for {model_id}.")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = OVModelForSeq2SeqLM.from_pretrained(model_id, export=True, compile=False)
+    model.save_pretrained(str(artifact_dir))
+    tokenizer.save_pretrained(str(artifact_dir))
+    return f"Exported OpenVINO artifacts for {model_id} to {artifact_dir}"
+
+
+def _translate_torch_seq2seq_bundle(
     bundle: dict[str, object],
     cues: list[str],
     progress: ProgressCallback | None = None,
@@ -440,17 +723,62 @@ def _translate_seq2seq_bundle(
     tokenizer = bundle["tokenizer"]
     model = bundle["model"]
     device = str(bundle.get("device") or "cpu")
-    batch_size = 8
+    total_batches = max((len(cues) + MARIAN_BATCH_SIZE - 1) // MARIAN_BATCH_SIZE, 1)
     translations: list[str] = []
-    total_batches = (len(cues) + batch_size - 1) // batch_size
+    lock: Lock = bundle["lock"]  # type: ignore[assignment]
     model.eval()
-    with torch.no_grad():
-        for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
-            batch = cues[start : start + batch_size]
+    with lock:
+        with torch.no_grad():
+            for batch_index, start in enumerate(range(0, len(cues), MARIAN_BATCH_SIZE), start=1):
+                batch = cues[start : start + MARIAN_BATCH_SIZE]
+                _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
+                encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+                if device != "cpu":
+                    encoded = {key: value.to(device) for key, value in encoded.items()}
+                generated = model.generate(**encoded, max_new_tokens=256)
+                translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    return translations
+
+
+def _translate_ort_seq2seq_bundle(
+    bundle: dict[str, object],
+    cues: list[str],
+    progress: ProgressCallback | None = None,
+) -> list[str]:
+    if not cues:
+        return []
+    tokenizer = bundle["tokenizer"]
+    model = bundle["model"]
+    total_batches = max((len(cues) + MARIAN_BATCH_SIZE - 1) // MARIAN_BATCH_SIZE, 1)
+    translations: list[str] = []
+    lock: Lock = bundle["lock"]  # type: ignore[assignment]
+    with lock:
+        for batch_index, start in enumerate(range(0, len(cues), MARIAN_BATCH_SIZE), start=1):
+            batch = cues[start : start + MARIAN_BATCH_SIZE]
             _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
             encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
-            if device != "cpu":
-                encoded = {key: value.to(device) for key, value in encoded.items()}
+            generated = model.generate(**encoded, max_new_tokens=256)
+            translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    return translations
+
+
+def _translate_openvino_seq2seq_bundle(
+    bundle: dict[str, object],
+    cues: list[str],
+    progress: ProgressCallback | None = None,
+) -> list[str]:
+    if not cues:
+        return []
+    tokenizer = bundle["tokenizer"]
+    model = bundle["model"]
+    total_batches = max((len(cues) + MARIAN_BATCH_SIZE - 1) // MARIAN_BATCH_SIZE, 1)
+    translations: list[str] = []
+    lock: Lock = bundle["lock"]  # type: ignore[assignment]
+    with lock:
+        for batch_index, start in enumerate(range(0, len(cues), MARIAN_BATCH_SIZE), start=1):
+            batch = cues[start : start + MARIAN_BATCH_SIZE]
+            _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
+            encoded = tokenizer(batch, return_tensors="np", padding=True, truncation=True)
             generated = model.generate(**encoded, max_new_tokens=256)
             translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
     return translations
@@ -483,25 +811,43 @@ def _prepare_marian_batch(model_id: str, target_lang: str, cues: list[str]) -> l
             "pob": "pt_BR",
         }.get(target.canonical)
     elif "opus-mt-en-trk" in model_id:
-        token = {
-            "tur": "tur",
-        }.get(target.canonical)
+        token = {"tur": "tur"}.get(target.canonical)
+    elif "opus-mt-en-jap" in model_id:
+        token = {"jpn": "jap"}.get(target.canonical)
     if not token:
         return cues
     return [f">>{token}<< {cue}" for cue in cues]
 
 
 def _resolve_device_preference(device_preference: str, progress: ProgressCallback | None = None) -> str:
-    import torch  # type: ignore
-
-    normalized = (device_preference or "auto").lower()
+    normalized = _normalize_device_preference(device_preference)
     if normalized == "cpu":
         return "cpu"
     if normalized == "cuda":
-        if not torch.cuda.is_available():
+        if not _current_runtime_has_cuda():
             raise TranslationError("GPU processing was requested, but CUDA is not available in the selected Python runtime.")
         return "cuda"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if normalized == "directml":
+        if not _current_runtime_has_directml():
+            raise TranslationError("GPU processing was requested, but DirectML is not available in the selected Python runtime.")
+        return "directml"
+    if normalized == "openvino_gpu":
+        if not _current_runtime_has_openvino_gpu():
+            raise TranslationError("GPU processing was requested, but OpenVINO GPU is not available in the selected Python runtime.")
+        return "openvino_gpu"
+    if _current_runtime_has_cuda():
+        return "cuda"
+    if _current_runtime_has_openvino_gpu():
+        return "openvino_gpu"
+    if _current_runtime_has_directml():
+        return "directml"
+    if progress is not None:
+        _notify(progress, "runtime", "Falling back to CPU execution.")
+    return "cpu"
+
+
+def _normalize_device_preference(device_preference: str | None) -> str:
+    return (device_preference or "auto").strip().lower()
 
 
 def _resolve_runtime(packages: list[str], prefer_cuda: bool = False) -> PythonRuntime:
@@ -544,7 +890,6 @@ def _discover_python_executables() -> list[str]:
     if env_override:
         candidates.append(env_override)
     candidates.extend(_discover_local_virtualenvs())
-
     candidates.extend(_discover_with_command(["py", "-0p"]))
     candidates.extend(_discover_with_command(["where", "python"]))
     candidates.extend(_discover_with_command(["where", "py"]))
@@ -652,9 +997,7 @@ def _ensure_python_packages(packages: list[str], feature_name: str, progress: Pr
             f"Polylinguist failed to install the Python runtime packages for {feature_name}: {detail}"
         )
     except OSError as exc:
-        raise TranslationError(
-            f"Polylinguist could not launch pip for {feature_name}: {exc}"
-        ) from exc
+        raise TranslationError(f"Polylinguist could not launch pip for {feature_name}: {exc}") from exc
 
 
 def _run_worker(
@@ -757,6 +1100,26 @@ def _current_runtime_has_cuda() -> bool:
         return False
 
 
+def _current_runtime_has_directml() -> bool:
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        providers = {provider.lower() for provider in ort.get_available_providers()}
+        return "dmlexecutionprovider" in providers or "directmlexecutionprovider" in providers
+    except Exception:
+        return False
+
+
+def _current_runtime_has_openvino_gpu() -> bool:
+    try:
+        from openvino.runtime import Core  # type: ignore
+
+        core = Core()
+        return any(device.upper().startswith("GPU") for device in core.available_devices)
+    except Exception:
+        return False
+
+
 def _python_runtime_has_cuda(executable: str) -> bool:
     if _same_executable(executable, sys.executable):
         return _current_runtime_has_cuda()
@@ -777,6 +1140,14 @@ def _argos_path_from_model_id(model_id: str) -> tuple[str, str]:
 
 def _hf_runtime_packages() -> list[str]:
     return ["huggingface-hub", "transformers", "torch", "sentencepiece"]
+
+
+def _ort_runtime_packages() -> list[str]:
+    return ["transformers", "optimum", "onnx", "onnxruntime-directml"]
+
+
+def _openvino_runtime_packages() -> list[str]:
+    return ["transformers", "optimum-intel", "openvino"]
 
 
 def _module_name_for_package(package: str) -> str:

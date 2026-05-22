@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from polylinguist.config import AppPaths
+from polylinguist.config import AppConfig, AppPaths
 from polylinguist.schemas import AddonSettings
 from polylinguist.services.cache import SubtitleCache
 from polylinguist.services.install_jobs import InstallJobManager
@@ -28,6 +28,7 @@ SUBTITLE_RENDER_VERSION = "3"
 
 @dataclass
 class AppServices:
+    config: AppConfig
     paths: AppPaths
     settings_store: SettingsStore
     system_profile_service: SystemProfileService
@@ -63,13 +64,40 @@ class AppServices:
         if not settings.selected_model_id:
             return []
 
-        if not self.translation_manager.is_installed(provider, settings.selected_model_id):
+        profile = self.system_profile_service.detect()
+        allowed, reason = self.model_catalog.validate_processing_target(
+            profile,
+            provider,
+            settings.selected_model_id,
+            settings.source_lang,
+            settings.target_lang,
+            settings.processing_device,
+        )
+        if not allowed:
+            payload = encode_subtitle_payload(
+                {
+                    "status_only": "true",
+                    "status_title": "Polylinguist configuration needs attention.",
+                    "status_detail": reason or "The selected processing target is not supported on this machine.",
+                    "status_hint": f"Open {self.config.external_base_url(base_url)}/configure and choose a supported processing target.",
+                }
+            )
+            return [
+                {
+                    "id": f"poly-invalid-{provider}",
+                    "lang": self._display_lang(settings),
+                    "label": f"Polylinguist configuration issue - {settings.source_lang.upper()}+{settings.target_lang.upper()}",
+                    "url": f"{base_url}/subs/{payload}.srt",
+                }
+            ]
+
+        if not self.translation_manager.is_installed(provider, settings.selected_model_id, settings.processing_device):
             payload = encode_subtitle_payload(
                 {
                     "status_only": "true",
                     "status_title": "Polylinguist setup required.",
                     "status_detail": f"Install {provider.title()} model {settings.selected_model_id} from the Polylinguist configurator before using this subtitle.",
-                    "status_hint": "Open http://127.0.0.1:8001/configure, install the selected model, then re-select this subtitle in Stremio.",
+                    "status_hint": f"Open {self.config.external_base_url(base_url)}/configure, install the selected model, then re-select this subtitle in Stremio.",
                 }
             )
             return [
@@ -106,6 +134,7 @@ class AppServices:
                     "candidate_label": candidate.match_label,
                     "candidate_name": candidate.label,
                     "media_filename": extra.filename or "",
+                    "configure_url": f"Open {self.config.external_base_url(base_url)}/configure for progress, then re-select this subtitle when it is ready.",
                 }
             )
             if index == 1:
@@ -206,18 +235,20 @@ class AppServices:
         return f"{settings.source_lang}+{settings.target_lang}"
 
 
-def create_services(paths: AppPaths | None = None) -> AppServices:
+def create_services(paths: AppPaths | None = None, config: AppConfig | None = None) -> AppServices:
     app_paths = paths or AppPaths.detect()
     app_paths.ensure()
+    app_config = config or AppConfig.detect()
     settings_store = SettingsStore(app_paths.settings_file)
     model_registry = InstalledModelRegistry(app_paths.installed_models_file)
     return AppServices(
+        config=app_config,
         paths=app_paths,
         settings_store=settings_store,
         system_profile_service=SystemProfileService(),
         model_registry=model_registry,
-        model_catalog=ModelCatalogService(app_paths.metadata_cache_file, model_registry),
-        translation_manager=TranslationManager(model_registry),
+        model_catalog=ModelCatalogService(app_paths.metadata_cache_file, model_registry, app_paths.model_artifacts_dir),
+        translation_manager=TranslationManager(model_registry, app_paths.model_artifacts_dir),
         subtitle_provider=OpenSubtitlesProvider(),
         subtitle_cache=SubtitleCache(app_paths.generated_subtitles_dir),
         install_job_manager=InstallJobManager(),

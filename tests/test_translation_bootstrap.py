@@ -13,6 +13,8 @@ from polylinguist.services.translation import (
 def test_module_name_mapping():
     assert _module_name_for_package("huggingface-hub") == "huggingface_hub"
     assert _module_name_for_package("sentencepiece") == "sentencepiece"
+    assert _module_name_for_package("onnxruntime-directml") == "onnxruntime"
+    assert _module_name_for_package("optimum-intel") == "optimum.intel"
 
 
 def test_bootstrap_skips_when_modules_exist(monkeypatch):
@@ -74,3 +76,13 @@ def test_device_preference_rejects_missing_cuda(monkeypatch):
         assert "CUDA is not available" in str(exc)
     else:
         raise AssertionError("Expected TranslationError when CUDA is unavailable.")
+
+
+def test_device_preference_rejects_missing_directml(monkeypatch):
+    monkeypatch.setitem(sys.modules, "onnxruntime", type("Ort", (), {"get_available_providers": staticmethod(lambda: ["CPUExecutionProvider"])})())
+    try:
+        _resolve_device_preference("directml")
+    except TranslationError as exc:
+        assert "DirectML is not available" in str(exc)
+    else:
+        raise AssertionError("Expected TranslationError when DirectML is unavailable.")

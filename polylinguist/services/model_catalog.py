@@ -8,7 +8,7 @@ import httpx
 
 from polylinguist.schemas import ModelCatalogResponse, ModelOptionResponse
 from polylinguist.services.languages import get_language, normalize_language
-from polylinguist.services.local_models import hf_model_cache_exists
+from polylinguist.services.local_models import hf_model_cache_exists, local_model_artifact_exists
 from polylinguist.services.model_registry import InstalledModelRegistry
 from polylinguist.services.system_profile import SystemProfile
 
@@ -56,15 +56,20 @@ class ModelDescriptor:
     available: bool
     direct: bool
     installed: bool
+    installed_targets: tuple[str, ...]
+    supported_targets: tuple[str, ...]
+    recommended_target: str | None = None
+    availability_reason: str | None = None
     note: str | None = None
     license: str | None = None
     install_strategy: str = "direct"
 
 
 class ModelCatalogService:
-    def __init__(self, metadata_cache_file: Path, registry: InstalledModelRegistry) -> None:
+    def __init__(self, metadata_cache_file: Path, registry: InstalledModelRegistry, model_artifacts_dir: Path) -> None:
         self.metadata_cache_file = metadata_cache_file
         self.registry = registry
+        self.model_artifacts_dir = model_artifacts_dir
 
     def list_models(self, source_lang: str, target_lang: str, profile: SystemProfile) -> ModelCatalogResponse:
         source = normalize_language(source_lang) or source_lang
@@ -72,8 +77,8 @@ class ModelCatalogService:
 
         descriptors: list[ModelDescriptor] = []
         descriptors.extend(self._argos_descriptors(source, target))
-        descriptors.extend(self._marian_descriptors(source, target))
-        descriptors.extend(self._nllb_descriptors(source, target))
+        descriptors.extend(self._marian_descriptors(source, target, profile))
+        descriptors.extend(self._nllb_descriptors(source, target, profile))
 
         recommended = self.recommend(source, target, profile, descriptors)
         models = [
@@ -87,6 +92,10 @@ class ModelCatalogService:
                 available=item.available,
                 direct=item.direct,
                 installed=item.installed,
+                installed_targets=list(item.installed_targets),
+                supported_targets=list(item.supported_targets),
+                recommended_target=item.recommended_target,
+                availability_reason=item.availability_reason,
                 note=item.note,
                 license=item.license,
                 recommended=bool(recommended and recommended.provider == item.provider and recommended.model_id == item.model_id),
@@ -127,6 +136,34 @@ class ModelCatalogService:
             return pick("marian") or pick("argos") or pick("nllb")
         return pick("marian") or pick("nllb") or pick("argos")
 
+    def validate_processing_target(
+        self,
+        profile: SystemProfile,
+        provider: str,
+        model_id: str,
+        source_lang: str,
+        target_lang: str,
+        processing_device: str,
+    ) -> tuple[bool, str | None]:
+        response = self.list_models(source_lang, target_lang, profile)
+        model = next(
+            (item for item in response.models if item.provider == provider and item.model_id == model_id),
+            None,
+        )
+        if model is None:
+            return False, "Requested model is not available for this language pair."
+        if not model.available:
+            return False, model.availability_reason or "Requested model is unavailable."
+        normalized = (processing_device or "auto").lower()
+        if normalized == "auto":
+            return True, None
+        if normalized not in model.supported_targets:
+            supported = ", ".join(model.supported_targets) or "none"
+            return False, f"{model.label} does not support '{normalized}'. Supported targets: {supported}."
+        if normalized != "cpu" and not profile.supports_target(normalized):
+            return False, f"The current machine does not expose the '{normalized}' processing target."
+        return True, None
+
     def _argos_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
@@ -152,6 +189,10 @@ class ModelCatalogService:
                     available=True,
                     direct=True,
                     installed=self.registry.is_installed("argos", model_id),
+                    installed_targets=("cpu",) if self.registry.is_installed("argos", model_id) else (),
+                    supported_targets=("cpu",),
+                    recommended_target="cpu",
+                    availability_reason="Direct Argos package available.",
                     note="Smallest offline option.",
                     license="MIT",
                 )
@@ -171,6 +212,10 @@ class ModelCatalogService:
                     available=True,
                     direct=False,
                     installed=self.registry.is_installed("argos", model_id),
+                    installed_targets=("cpu",) if self.registry.is_installed("argos", model_id) else (),
+                    supported_targets=("cpu",),
+                    recommended_target="cpu",
+                    availability_reason="Argos pair available through an English pivot.",
                     note="Uses English pivot because no direct Argos pair is indexed.",
                     license="MIT",
                     install_strategy="pivot",
@@ -188,12 +233,16 @@ class ModelCatalogService:
                 available=False,
                 direct=True,
                 installed=False,
+                installed_targets=(),
+                supported_targets=("cpu",),
+                recommended_target="cpu",
+                availability_reason="No direct or pivot package found in the Argos index.",
                 note="No direct or pivot package found in the Argos index.",
                 license="MIT",
             )
         ]
 
-    def _marian_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
+    def _marian_descriptors(self, source_lang: str, target_lang: str, profile: SystemProfile) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
         if not source or not target or not source.marian_code or not target.marian_code:
@@ -207,6 +256,9 @@ class ModelCatalogService:
             model_id, note = MARIAN_ENGLISH_FALLBACKS[target_lang]
             available = self._probe_huggingface_model(model_id)
             direct = False
+        supported_targets = self._marian_supported_targets(profile)
+        recommended_target = self._preferred_accelerated_target(profile, supported_targets)
+        installed_targets = self._installed_targets_for_marian(model_id)
         return [
             ModelDescriptor(
                 provider="marian",
@@ -217,16 +269,22 @@ class ModelCatalogService:
                 size_mb=320,
                 available=available,
                 direct=direct,
-                installed=self._is_effectively_installed("marian", model_id),
+                installed=bool(installed_targets),
+                installed_targets=installed_targets,
+                supported_targets=supported_targets,
+                recommended_target=recommended_target,
+                availability_reason="MarianMT supports this language pair." if available else "No MarianMT route was found for this language pair.",
                 note=note,
                 license="Apache-2.0",
             )
         ]
 
-    def _nllb_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
+    def _nllb_descriptors(self, source_lang: str, target_lang: str, profile: SystemProfile) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
         available = bool(source and target and source.nllb_code and target.nllb_code)
+        installed_targets = self._installed_targets_for_nllb(NLLB_MODEL_ID)
+        supported_targets = tuple(self._nllb_supported_targets(source_lang, target_lang, profile))
         return [
             ModelDescriptor(
                 provider="nllb",
@@ -237,7 +295,11 @@ class ModelCatalogService:
                 size_mb=NLLB_SIZE_MB,
                 available=available,
                 direct=True,
-                installed=self._is_effectively_installed("nllb", NLLB_MODEL_ID),
+                installed=bool(installed_targets),
+                installed_targets=installed_targets,
+                supported_targets=supported_targets,
+                recommended_target="cuda" if "cuda" in supported_targets else "cpu",
+                availability_reason="NLLB supports this language pair." if available else "NLLB language codes are missing for this pair.",
                 note="Universal multilingual fallback. Larger and slower on CPU.",
                 license="CC-BY-NC-4.0",
             )
@@ -324,3 +386,46 @@ class ModelCatalogService:
         if provider in {"marian", "nllb"}:
             return hf_model_cache_exists(model_id)
         return False
+
+    def _marian_supported_targets(self, profile: SystemProfile) -> tuple[str, ...]:
+        targets = ["cpu"]
+        if profile.supports_target("cuda"):
+            targets.append("cuda")
+        if profile.supports_target("openvino_gpu"):
+            targets.append("openvino_gpu")
+        if profile.supports_target("directml"):
+            targets.append("directml")
+        return tuple(targets)
+
+    def _nllb_supported_targets(self, source_lang: str, target_lang: str, profile: SystemProfile) -> list[str]:
+        source = get_language(source_lang)
+        target = get_language(target_lang)
+        if not source or not target or not source.nllb_code or not target.nllb_code:
+            return []
+        targets = ["cpu"]
+        if profile.supports_target("cuda"):
+            targets.append("cuda")
+        return targets
+
+    @staticmethod
+    def _preferred_accelerated_target(profile: SystemProfile, supported_targets: tuple[str, ...]) -> str:
+        for target in ("cuda", "openvino_gpu", "directml", "cpu"):
+            if target in supported_targets and (target == "cpu" or profile.supports_target(target)):
+                return target
+        return "cpu"
+
+    def _installed_targets_for_marian(self, model_id: str) -> tuple[str, ...]:
+        installed = set(self.registry.installed_targets("marian", model_id))
+        if self.registry.is_installed("marian", model_id) or hf_model_cache_exists(model_id):
+            installed.update({"cpu", "cuda"})
+        if local_model_artifact_exists(self.model_artifacts_dir, "marian", model_id, "directml"):
+            installed.add("directml")
+        if local_model_artifact_exists(self.model_artifacts_dir, "marian", model_id, "openvino_gpu"):
+            installed.add("openvino_gpu")
+        return tuple(sorted(installed))
+
+    def _installed_targets_for_nllb(self, model_id: str) -> tuple[str, ...]:
+        installed = set(self.registry.installed_targets("nllb", model_id))
+        if self.registry.is_installed("nllb", model_id) or hf_model_cache_exists(model_id):
+            installed.update({"cpu", "cuda"})
+        return tuple(sorted(installed))

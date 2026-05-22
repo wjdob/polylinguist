@@ -2,10 +2,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from polylinguist.config import AppPaths
+from polylinguist.config import AppConfig, AppPaths
 from polylinguist.schemas import AddonSettings, ModelCatalogResponse, ModelOptionResponse
 from polylinguist.services.runtime import AppServices, create_services
-from polylinguist.services.system_profile import SystemProfile
+from polylinguist.services.system_profile import AcceleratorInfo, SystemProfile
 from polylinguist.services.subtitle_sources import SubtitleSourceExtra
 from polylinguist.services.subtitles import SubtitleCandidate
 from polylinguist.app import create_app
@@ -36,7 +36,7 @@ class FakeTranslationManager:
     def __init__(self):
         self.installed = {("marian", "fake-model")}
 
-    def is_installed(self, provider, model_id):
+    def is_installed(self, provider, model_id, device_preference="auto"):
         return (provider, model_id) in self.installed
 
     def translate_batch(self, request, cues, progress=None):
@@ -56,12 +56,13 @@ def build_test_app(tmp_path: Path):
     paths = AppPaths(
         root=tmp_path / ".polylinguist",
         cache_dir=tmp_path / ".polylinguist" / "cache",
+        model_artifacts_dir=tmp_path / ".polylinguist" / "models",
         settings_file=tmp_path / ".polylinguist" / "settings.json",
         installed_models_file=tmp_path / ".polylinguist" / "installed_models.json",
         metadata_cache_file=tmp_path / ".polylinguist" / "cache" / "model_metadata.json",
         generated_subtitles_dir=tmp_path / ".polylinguist" / "cache" / "subtitles",
     )
-    services = create_services(paths)
+    services = create_services(paths, AppConfig.detect())
     services.settings_store.save(
         AddonSettings(
             source_lang="eng",
@@ -89,6 +90,10 @@ def build_test_app(tmp_path: Path):
                 available=True,
                 direct=True,
                 installed=True,
+                installed_targets=["cpu"],
+                supported_targets=["cpu"],
+                recommended_target="cpu",
+                availability_reason="Fake Marian supports CPU.",
                 license="test",
                 recommended=True,
             )
@@ -101,12 +106,13 @@ def build_uninstalled_test_app(tmp_path: Path):
     paths = AppPaths(
         root=tmp_path / ".polylinguist",
         cache_dir=tmp_path / ".polylinguist" / "cache",
+        model_artifacts_dir=tmp_path / ".polylinguist" / "models",
         settings_file=tmp_path / ".polylinguist" / "settings.json",
         installed_models_file=tmp_path / ".polylinguist" / "installed_models.json",
         metadata_cache_file=tmp_path / ".polylinguist" / "cache" / "model_metadata.json",
         generated_subtitles_dir=tmp_path / ".polylinguist" / "cache" / "subtitles",
     )
-    services = create_services(paths)
+    services = create_services(paths, AppConfig.detect())
     services.settings_store.save(
         AddonSettings(
             source_lang="eng",
@@ -136,6 +142,75 @@ def build_uninstalled_test_app(tmp_path: Path):
                 available=True,
                 direct=False,
                 installed=False,
+                installed_targets=[],
+                supported_targets=["cpu", "cuda"],
+                recommended_target="cuda",
+                availability_reason="Fake Marian supports CPU and CUDA.",
+                license="test",
+                recommended=True,
+            )
+        ],
+    )
+    return create_app(services)
+
+
+def build_remote_admin_app(tmp_path: Path):
+    paths = AppPaths(
+        root=tmp_path / ".polylinguist",
+        cache_dir=tmp_path / ".polylinguist" / "cache",
+        model_artifacts_dir=tmp_path / ".polylinguist" / "models",
+        settings_file=tmp_path / ".polylinguist" / "settings.json",
+        installed_models_file=tmp_path / ".polylinguist" / "installed_models.json",
+        metadata_cache_file=tmp_path / ".polylinguist" / "cache" / "model_metadata.json",
+        generated_subtitles_dir=tmp_path / ".polylinguist" / "cache" / "subtitles",
+    )
+    config = AppConfig(
+        bind_host="0.0.0.0",
+        bind_port=8000,
+        public_base_url="https://subs.example.test",
+        admin_token="secret-token",
+    )
+    services = create_services(paths, config)
+    services.settings_store.save(
+        AddonSettings(
+            source_lang="eng",
+            target_lang="spa",
+            preferred_provider="marian",
+            selected_model_id="fake-model",
+        )
+    )
+    services.subtitle_provider = FakeProvider()
+    services.translation_manager = FakeTranslationManager()
+    services.model_catalog.list_models = lambda source_lang, target_lang, profile: ModelCatalogResponse(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        recommended_provider="marian",
+        recommended_model_id="fake-model",
+        profile=SystemProfile(
+            "windows",
+            "amd64",
+            8,
+            16.0,
+            50.0,
+            False,
+            False,
+            accelerators=(AcceleratorInfo(vendor="intel", name="Arc A750", supported_targets=("openvino_gpu",)),),
+        ).to_response(),
+        models=[
+            ModelOptionResponse(
+                provider="marian",
+                model_id="fake-model",
+                label="Fake Marian",
+                source_lang=source_lang,
+                target_lang=target_lang,
+                size_mb=1,
+                available=True,
+                direct=True,
+                installed=True,
+                installed_targets=["openvino_gpu"],
+                supported_targets=["cpu", "openvino_gpu"],
+                recommended_target="openvino_gpu",
+                availability_reason="Fake Marian supports OpenVINO GPU.",
                 license="test",
                 recommended=True,
             )
@@ -276,3 +351,28 @@ def test_manifest_has_cors_headers(tmp_path: Path):
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_remote_manifest_uses_public_base_url(tmp_path: Path):
+    app = build_remote_admin_app(tmp_path)
+    client = TestClient(app)
+
+    manifest = client.get("/manifest.json")
+    assert manifest.status_code == 200
+    payload = manifest.json()
+    assert payload["links"]["manifest"].startswith("https://subs.example.test/")
+    assert payload["links"]["configure"] == "https://subs.example.test/configure"
+
+
+def test_admin_token_protects_api_routes(tmp_path: Path):
+    app = build_remote_admin_app(tmp_path)
+    client = TestClient(app)
+
+    unauthorized = client.get("/api/settings")
+    assert unauthorized.status_code == 401
+
+    authorized = client.get(
+        "/api/settings",
+        headers={"X-Polylinguist-Admin-Token": "secret-token"},
+    )
+    assert authorized.status_code == 200

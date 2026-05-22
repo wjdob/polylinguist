@@ -6,13 +6,22 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+ProcessingDevice = Literal["auto", "cpu", "cuda", "directml", "openvino_gpu"]
+
+
 class AddonSettings(BaseModel):
     source_lang: str = "eng"
     target_lang: str = "spa"
     preferred_provider: str = "auto"
     selected_model_id: str | None = None
-    processing_device: Literal["auto", "cpu", "cuda"] = "auto"
+    processing_device: ProcessingDevice = "auto"
     format_mode: Literal["dual", "translated_only"] = "dual"
+
+
+class AcceleratorResponse(BaseModel):
+    vendor: str
+    name: str
+    supported_targets: list[str] = Field(default_factory=list)
 
 
 class SettingsEnvelope(BaseModel):
@@ -28,6 +37,7 @@ class SystemProfileResponse(BaseModel):
     free_disk_gb: float
     has_cuda: bool
     has_mps: bool
+    accelerators: list[AcceleratorResponse] = Field(default_factory=list)
     tier: Literal["low", "standard", "strong"]
 
 
@@ -41,6 +51,10 @@ class ModelOptionResponse(BaseModel):
     available: bool
     direct: bool
     installed: bool
+    installed_targets: list[str] = Field(default_factory=list)
+    supported_targets: list[str] = Field(default_factory=list)
+    recommended_target: str | None = None
+    availability_reason: str | None = None
     note: str | None = None
     license: str | None = None
     recommended: bool = False
@@ -61,7 +75,7 @@ class ModelInstallRequest(BaseModel):
     model_id: str
     source_lang: str
     target_lang: str
-    processing_device: Literal["auto", "cpu", "cuda"] = "auto"
+    processing_device: ProcessingDevice = "auto"
     persist_selection: bool = True
 
 

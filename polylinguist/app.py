@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from polylinguist.config import AppPaths
+from polylinguist.config import AppConfig, AppPaths
 from polylinguist.schemas import (
     AddonSettings,
     InstallJobResponse,
@@ -38,18 +38,29 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.services = services or create_services(AppPaths.detect())
+    app.state.services = services or create_services(AppPaths.detect(), AppConfig.detect())
 
     @app.get("/", response_class=HTMLResponse)
     async def root(request: Request) -> str:
-        return render_configure_page(str(request.base_url).rstrip("/"))
+        services = get_services(request)
+        return render_configure_page(
+            str(request.base_url).rstrip("/"),
+            services.config.external_base_url(str(request.base_url).rstrip("/")),
+            services.config.admin_enabled,
+        )
 
     @app.get("/configure", response_class=HTMLResponse)
     async def configure(request: Request) -> str:
-        return render_configure_page(str(request.base_url).rstrip("/"))
+        services = get_services(request)
+        return render_configure_page(
+            str(request.base_url).rstrip("/"),
+            services.config.external_base_url(str(request.base_url).rstrip("/")),
+            services.config.admin_enabled,
+        )
 
     @app.get("/api/languages", response_model=list[LanguageResponse])
-    async def get_languages() -> list[LanguageResponse]:
+    async def get_languages(request: Request) -> list[LanguageResponse]:
+        require_admin_access(request)
         return [
             LanguageResponse(
                 code=item.canonical,
@@ -62,16 +73,31 @@ def create_app(services: AppServices | None = None) -> FastAPI:
 
     @app.get("/api/system/profile")
     async def get_system_profile(request: Request) -> dict[str, Any]:
+        require_admin_access(request)
         services = get_services(request)
         return services.system_profile_service.detect().to_response().model_dump()
 
     @app.get("/api/settings", response_model=SettingsEnvelope)
     async def get_settings(request: Request) -> SettingsEnvelope:
+        require_admin_access(request)
         return get_services(request).settings_store.load()
 
     @app.put("/api/settings", response_model=SettingsEnvelope)
     async def put_settings(request: Request, settings: AddonSettings) -> SettingsEnvelope:
-        return get_services(request).settings_store.save(settings)
+        require_admin_access(request)
+        services = get_services(request)
+        if settings.selected_model_id and settings.preferred_provider != "auto":
+            allowed, reason = services.model_catalog.validate_processing_target(
+                services.system_profile_service.detect(),
+                settings.preferred_provider,
+                settings.selected_model_id,
+                settings.source_lang,
+                settings.target_lang,
+                settings.processing_device,
+            )
+            if not allowed:
+                raise HTTPException(status_code=400, detail=reason or "Unsupported processing target.")
+        return services.settings_store.save(settings)
 
     @app.get("/api/models", response_model=ModelCatalogResponse)
     async def get_models(
@@ -79,6 +105,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         source_lang: str = Query(...),
         target_lang: str = Query(...),
     ) -> ModelCatalogResponse:
+        require_admin_access(request)
         services = get_services(request)
         return services.model_catalog.list_models(
             source_lang,
@@ -88,11 +115,13 @@ def create_app(services: AppServices | None = None) -> FastAPI:
 
     @app.post("/api/models/install", response_model=InstallJobResponse)
     async def install_model(request: Request, payload: ModelInstallRequest) -> InstallJobResponse:
+        require_admin_access(request)
         services = get_services(request)
+        profile = services.system_profile_service.detect()
         catalog = services.model_catalog.list_models(
             payload.source_lang,
             payload.target_lang,
-            services.system_profile_service.detect(),
+            profile,
         )
         option = next(
             (
@@ -106,6 +135,10 @@ def create_app(services: AppServices | None = None) -> FastAPI:
                     available=item.available,
                     direct=item.direct,
                     installed=item.installed,
+                    installed_targets=tuple(item.installed_targets),
+                    supported_targets=tuple(item.supported_targets),
+                    recommended_target=item.recommended_target,
+                    availability_reason=item.availability_reason,
                     note=item.note,
                     license=item.license,
                     install_strategy=item.install_strategy,
@@ -117,6 +150,18 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         )
         if option is None or not option.available:
             raise HTTPException(status_code=404, detail="Requested model is not available for this pair.")
+        requested_target = payload.processing_device
+        effective_target = (option.recommended_target or "cpu") if requested_target == "auto" else requested_target
+        allowed, reason = services.model_catalog.validate_processing_target(
+            profile,
+            payload.provider,
+            payload.model_id,
+            payload.source_lang,
+            payload.target_lang,
+            effective_target,
+        )
+        if not allowed:
+            raise HTTPException(status_code=400, detail=reason or "Unsupported processing target.")
         if payload.persist_selection:
             current = services.settings_store.load().settings
             services.settings_store.save(
@@ -136,13 +181,14 @@ def create_app(services: AppServices | None = None) -> FastAPI:
             install_fn=lambda progress: services.translation_manager.install(
                 option,
                 progress,
-                payload.processing_device,
+                effective_target,
             ),
         )
         return InstallJobResponse.model_validate(job.to_dict())
 
     @app.get("/api/models/install/{job_id}", response_model=InstallJobResponse)
     async def get_install_job(request: Request, job_id: str) -> InstallJobResponse:
+        require_admin_access(request)
         services = get_services(request)
         job = services.install_job_manager.get_job(job_id)
         if job is None:
@@ -151,6 +197,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
 
     @app.get("/api/subtitles/status")
     async def get_subtitle_activity(request: Request) -> dict[str, Any]:
+        require_admin_access(request)
         services = get_services(request)
         return {
             "jobs": [job.to_dict() for job in services.subtitle_generation_tracker.recent()],
@@ -158,6 +205,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
 
     @app.get("/api/subtitles/status/{cache_key}")
     async def get_subtitle_status(request: Request, cache_key: str) -> dict[str, Any]:
+        require_admin_access(request)
         services = get_services(request)
         job = services.subtitle_generation_tracker.get(cache_key)
         if job is not None:
@@ -186,14 +234,15 @@ def create_app(services: AppServices | None = None) -> FastAPI:
     async def manifest(request: Request) -> dict[str, Any]:
         services = get_services(request)
         settings = services.settings_store.load().settings
-        base_url = str(request.base_url).rstrip("/")
+        base_url = services.config.external_base_url(str(request.base_url).rstrip("/"))
         config_token = encode_config(settings)
         return build_manifest(base_url, settings, config_token)
 
     @app.get("/{config_token}/manifest.json")
     async def configured_manifest(request: Request, config_token: str) -> dict[str, Any]:
+        services = get_services(request)
         settings = decode_config(config_token)
-        base_url = str(request.base_url).rstrip("/")
+        base_url = services.config.external_base_url(str(request.base_url).rstrip("/"))
         return build_manifest(base_url, settings, config_token)
 
     @app.get("/{config_token}/subtitles/{media_type}/{media_id}/{extra_path:path}")
@@ -273,7 +322,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
                 render_status_subtitle(
                     "Polylinguist is still translating this subtitle.",
                     message,
-                    "Open the Polylinguist configure page for progress, then re-select this subtitle when it is ready.",
+                    str(payload.get("configure_url") or "Open the Polylinguist configure page for progress, then re-select this subtitle when it is ready."),
                 ),
                 media_type="text/srt; charset=utf-8",
                 headers={"Cache-Control": "no-store"},
@@ -303,6 +352,20 @@ def get_services(request: Request) -> AppServices:
     return request.app.state.services
 
 
+def get_app_config(request: Request) -> AppConfig:
+    return get_services(request).config
+
+
+def require_admin_access(request: Request) -> None:
+    config = get_app_config(request)
+    if not config.admin_enabled:
+        return
+    token = (request.headers.get("X-Polylinguist-Admin-Token") or "").strip()
+    if token and token == config.admin_token:
+        return
+    raise HTTPException(status_code=401, detail="Admin token is required.")
+
+
 def encode_config(settings: AddonSettings) -> str:
     raw = settings.model_dump_json(exclude_none=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -327,6 +390,7 @@ async def build_subtitles_response(
     services = get_services(request)
     settings = decode_config(config_token)
     extra_params = parse_extra_args(path_extra)
+    base_url = services.config.external_base_url(str(request.base_url).rstrip("/"))
     items = await services.build_subtitle_options(
         settings=settings,
         media_type=media_type,
@@ -336,7 +400,7 @@ async def build_subtitles_response(
             video_size=videoSize or extra_params.get("videoSize"),
             video_hash=videoHash or extra_params.get("videoHash"),
         ),
-        base_url=str(request.base_url).rstrip("/"),
+        base_url=base_url,
     )
     return {
         "subtitles": items,
@@ -366,7 +430,7 @@ def render_status_subtitle(title: str, detail: str, hint: str | None = None) -> 
 def subtitle_wait_timeout_seconds(payload: dict[str, Any]) -> float:
     provider = str(payload.get("provider") or "")
     device = str(payload.get("processing_device") or "auto").lower()
-    if device == "cuda":
+    if device in {"cuda", "directml", "openvino_gpu"}:
         return 120.0
     if provider == "marian":
         return 240.0
@@ -412,8 +476,10 @@ def build_manifest(base_url: str, settings: AddonSettings, config_token: str) ->
     }
 
 
-def render_configure_page(base_url: str) -> str:
-    escaped_url = quote(base_url, safe=":/")
+def render_configure_page(api_base_url: str, manifest_base_url: str, admin_required: bool) -> str:
+    escaped_api_url = quote(api_base_url, safe=":/")
+    escaped_manifest_url = quote(manifest_base_url, safe=":/")
+    admin_required_literal = "true" if admin_required else "false"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -741,6 +807,8 @@ def render_configure_page(base_url: str) -> str:
               <option value="auto">Auto</option>
               <option value="cpu">CPU</option>
               <option value="cuda">GPU (CUDA)</option>
+              <option value="directml">GPU (DirectML)</option>
+              <option value="openvino_gpu">GPU (OpenVINO)</option>
             </select>
           </label>
           <button id="refresh-models" type="button">Evaluate models</button>
@@ -779,15 +847,43 @@ def render_configure_page(base_url: str) -> str:
   </div>
 
   <script>
-    const apiBase = "{escaped_url}";
+    const apiBase = "{escaped_api_url}";
+    const manifestBase = "{escaped_manifest_url}";
+    const adminRequired = {admin_required_literal};
+    const ADMIN_TOKEN_STORAGE_KEY = "polylinguistAdminToken";
+    const ADMIN_TOKEN_HEADER = "X-Polylinguist-Admin-Token";
     let currentSettings = null;
     let activeInstallJobId = null;
     let activeInstallPoll = null;
     let availableModels = [];
+    let latestCatalogPayload = null;
     let systemProfile = null;
 
     async function loadJson(path, options) {{
-      const response = await fetch(apiBase + path, options);
+      const init = options ? {{ ...options }} : {{}};
+      init.headers = new Headers(init.headers || {{}});
+      if (adminRequired) {{
+        let token = sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "";
+        if (!token) {{
+          token = window.prompt("Enter the Polylinguist admin token to manage this server.") || "";
+          if (!token) {{
+            throw new Error("Admin token is required.");
+          }}
+          sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+        }}
+        init.headers.set(ADMIN_TOKEN_HEADER, token);
+      }}
+      let response = await fetch(apiBase + path, init);
+      if (response.status === 401 && adminRequired) {{
+        sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+        const retryToken = window.prompt("Admin token was rejected. Enter the Polylinguist admin token again.") || "";
+        if (!retryToken) {{
+          throw new Error("Admin token is required.");
+        }}
+        sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, retryToken);
+        init.headers.set(ADMIN_TOKEN_HEADER, retryToken);
+        response = await fetch(apiBase + path, init);
+      }}
       const contentType = response.headers.get("content-type") || "";
       const payload = contentType.includes("application/json") ? await response.json() : await response.text();
       if (!response.ok) {{
@@ -798,7 +894,7 @@ def render_configure_page(base_url: str) -> str:
 
     function manifestUrl(settings) {{
       const encoded = btoa(JSON.stringify(settings)).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
-      return apiBase + "/" + encoded + "/manifest.json";
+      return manifestBase + "/" + encoded + "/manifest.json";
     }}
 
     function fillLanguages(items) {{
@@ -877,6 +973,9 @@ def render_configure_page(base_url: str) -> str:
 
     function renderSystemProfile(profile) {{
       systemProfile = profile;
+      const acceleratorSummary = (profile.accelerators || []).length
+        ? " • accelerators: " + profile.accelerators.map((item) => item.name + " [" + item.supported_targets.join(", ") + "]").join(" | ")
+        : "";
       document.getElementById("system-profile").textContent =
         profile.os + " / " + profile.arch +
         " • " + profile.cpu_cores + " cores" +
@@ -884,15 +983,31 @@ def render_configure_page(base_url: str) -> str:
         " • " + profile.free_disk_gb.toFixed(1) + " GB free" +
         " • tier: " + profile.tier +
         " • CUDA: " + (profile.has_cuda ? "yes" : "no") +
-        " • MPS: " + (profile.has_mps ? "yes" : "no");
-      const gpuOption = document.querySelector('#processing-device option[value="cuda"]');
-      gpuOption.disabled = !profile.has_cuda;
-      if (!profile.has_cuda && document.getElementById("processing-device").value === "cuda") {{
+        " • MPS: " + (profile.has_mps ? "yes" : "no") +
+        acceleratorSummary;
+      const supportedTargets = new Set(["cpu", "auto"]);
+      if (profile.has_cuda) {{
+        supportedTargets.add("cuda");
+      }}
+      for (const accelerator of profile.accelerators || []) {{
+        for (const target of accelerator.supported_targets || []) {{
+          supportedTargets.add(target);
+        }}
+      }}
+      for (const value of ["cuda", "directml", "openvino_gpu"]) {{
+        const option = document.querySelector('#processing-device option[value="' + value + '"]');
+        if (!option) {{
+          continue;
+        }}
+        option.disabled = !supportedTargets.has(value);
+      }}
+      if (!supportedTargets.has(document.getElementById("processing-device").value) && document.getElementById("processing-device").value !== "auto") {{
         document.getElementById("processing-device").value = "auto";
       }}
     }}
 
     function renderModels(payload) {{
+      latestCatalogPayload = payload;
       availableModels = payload.models || [];
       const container = document.getElementById("models");
       container.innerHTML = "";
@@ -905,14 +1020,22 @@ def render_configure_page(base_url: str) -> str:
         const div = document.createElement("div");
         div.className = "model" + (item.recommended ? " recommended" : "");
         const note = item.note ? "<div class=\\"meta\\">" + item.note + "</div>" : "";
+        const availability = item.availability_reason ? "<div class=\\"meta\\">" + item.availability_reason + "</div>" : "";
+        const selectedTarget = effectiveProcessingTarget(item);
+        const targetList = (item.supported_targets || []).join(", ");
+        const targetMeta = "<div class=\\"meta\\">Targets: " + targetList + " • Recommended: " + (item.recommended_target || "cpu") + "</div>";
+        const canInstall = isModelSelectableForTarget(item, selectedTarget);
+        const installedForTarget = (item.installed_targets || []).includes(selectedTarget);
         const badge = item.recommended ? "Recommended for this machine" : item.available ? "Available" : "Unavailable";
         div.innerHTML =
           "<strong>" + item.label + "</strong>" +
           "<div class=\\"meta\\">" + badge + " • " + item.size_mb + " MB • " + item.license + "</div>" +
+          targetMeta +
+          availability +
           note +
           "<div class=\\"install-row\\">" +
-            "<button type=\\"button\\" " + (item.available ? "" : "disabled") + " data-provider=\\"" + item.provider + "\\" data-model-id=\\"" + item.model_id + "\\">" +
-              (item.installed ? "Reinstall" : "Install") +
+            "<button type=\\"button\\" " + (canInstall ? "" : "disabled") + " data-provider=\\"" + item.provider + "\\" data-model-id=\\"" + item.model_id + "\\" data-target=\\"" + selectedTarget + "\\">" +
+              (installedForTarget ? "Reinstall for " + selectedTarget : "Install for " + selectedTarget) +
             "</button>" +
           "</div>";
         container.appendChild(div);
@@ -920,6 +1043,18 @@ def render_configure_page(base_url: str) -> str:
       for (const button of container.querySelectorAll("button[data-provider]")) {{
         button.addEventListener("click", installModel);
       }}
+    }}
+
+    function effectiveProcessingTarget(item) {{
+      const requested = document.getElementById("processing-device").value || "auto";
+      if (requested !== "auto") {{
+        return requested;
+      }}
+      return item.recommended_target || "cpu";
+    }}
+
+    function isModelSelectableForTarget(item, target) {{
+      return item.available && (item.supported_targets || []).includes(target);
     }}
 
     function renderModelSelect(payload) {{
@@ -933,8 +1068,8 @@ def render_configure_page(base_url: str) -> str:
       for (const item of payload.models || []) {{
         const option = document.createElement("option");
         option.value = item.provider + "::" + item.model_id;
-        option.textContent = item.label + (item.installed ? " [installed]" : "") + (item.recommended ? " [recommended]" : "");
-        option.disabled = !item.available;
+        option.textContent = item.label + ((item.installed_targets || []).length ? " [installed]" : "") + (item.recommended ? " [recommended]" : "");
+        option.disabled = !isModelSelectableForTarget(item, effectiveProcessingTarget(item));
         select.appendChild(option);
       }}
       const explicitExists = Array.from(select.options).some((option) => option.value === previous);
@@ -1112,6 +1247,9 @@ def render_configure_page(base_url: str) -> str:
     function refreshManifestPreview() {{
       currentSettings = readSettings();
       renderManifest(currentSettings);
+      if (latestCatalogPayload) {{
+        renderModels(latestCatalogPayload);
+      }}
     }}
 
     async function boot() {{
@@ -1126,10 +1264,20 @@ def render_configure_page(base_url: str) -> str:
       document.getElementById("source-lang").value = currentSettings.source_lang;
       document.getElementById("target-lang").value = currentSettings.target_lang;
       document.getElementById("format-mode").value = currentSettings.format_mode;
+      const requestedTarget = currentSettings.processing_device || "auto";
+      const supportedTargets = new Set(["auto", "cpu"]);
+      if (profile.has_cuda) {{
+        supportedTargets.add("cuda");
+      }}
+      for (const accelerator of profile.accelerators || []) {{
+        for (const target of accelerator.supported_targets || []) {{
+          supportedTargets.add(target);
+        }}
+      }}
       document.getElementById("processing-device").value =
-        currentSettings.processing_device === "cuda" && !profile.has_cuda
-          ? "auto"
-          : (currentSettings.processing_device || "auto");
+        supportedTargets.has(requestedTarget)
+          ? requestedTarget
+          : "auto";
       renderManifest(currentSettings);
       await evaluateModels();
       await refreshSubtitleActivity();

@@ -47,7 +47,7 @@ def main() -> None:
         "target_lang": args.target_lang,
         "cue_count": len(cue_texts),
         "char_count": char_count,
-        "batch_size": args.batch_size,
+        "batch_size": result.get("batch_size", args.batch_size),
         "target_token": result.get("target_token"),
         "setup_seconds": round(result["setup_seconds"], 3),
         "load_seconds": round(result["load_seconds"], 3),
@@ -245,9 +245,10 @@ def benchmark_marian_openvino(args: argparse.Namespace, cues: list[str]) -> dict
 
     translate_started = time.perf_counter()
     target_token = resolve_marian_target_token(args, model_id)
+    stable_batch_size = 1
     translations: list[str] = []
-    for start in range(0, len(cues), args.batch_size):
-        batch = cues[start : start + args.batch_size]
+    for start in range(0, len(cues), stable_batch_size):
+        batch = cues[start : start + stable_batch_size]
         if target_token:
             batch = [f">>{target_token}<< {item}" for item in batch]
         encoded = tokenizer(batch, return_tensors="np", padding=True, truncation=True)
@@ -264,6 +265,7 @@ def benchmark_marian_openvino(args: argparse.Namespace, cues: list[str]) -> dict
         "gpu_memory_mb": None,
         "sample_output": translations[:3],
         "target_token": target_token,
+        "batch_size": stable_batch_size,
     }
 
 

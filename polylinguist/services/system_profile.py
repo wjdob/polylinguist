@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -179,8 +180,21 @@ def _detect_total_ram_gb() -> float:
 
 
 def _detect_free_disk_gb() -> float:
-    usage = shutil.disk_usage(os.getenv("POLYLINGUIST_HOME", str(os.path.expanduser("~"))))
-    return usage.free / (1024 ** 3)
+    candidates = [
+        os.getenv("POLYLINGUIST_HOME"),
+        str(os.path.expanduser("~")),
+        os.getcwd(),
+        os.path.abspath(os.sep),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            usage = shutil.disk_usage(candidate)
+            return usage.free / (1024 ** 3)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+            continue
+    return 20.0
 
 
 def _detect_cuda() -> bool:
@@ -272,9 +286,20 @@ def _supports_directml_adapter(adapter: _VideoAdapter) -> bool:
 def _supports_openvino_gpu_adapter(adapter: _VideoAdapter) -> bool:
     if adapter.vendor != "intel":
         return False
+    if not _python_supports_openvino_gpu():
+        return False
     lowered = adapter.name.lower()
     unsupported_markers = ("basic display", "remote display", "virtual", "hyper-v")
-    return not any(marker in lowered for marker in unsupported_markers)
+    if any(marker in lowered for marker in unsupported_markers):
+        return False
+    arc_markers = ("intel arc", "arc(tm)", " arc a", " arc b", " arc pro")
+    return any(marker in lowered for marker in arc_markers)
+
+
+def _python_supports_openvino_gpu() -> bool:
+    if platform.system().lower() != "windows":
+        return True
+    return sys.version_info < (3, 14)
 
 
 def _directml_runtime_ready() -> bool:

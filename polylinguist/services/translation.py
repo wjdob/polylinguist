@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+from importlib import metadata as importlib_metadata
 import json
 import os
 import platform
@@ -12,6 +13,8 @@ import sys
 from threading import Lock, Thread
 import time
 from typing import Callable
+
+from packaging.requirements import Requirement
 
 from polylinguist.services.languages import get_language
 from polylinguist.services.local_models import (
@@ -32,12 +35,14 @@ PACKAGE_MODULES = {
     "openvino": "openvino",
     "optimum": "optimum.onnxruntime",
     "optimum-intel": "optimum.intel",
+    "pillow": "PIL",
     "sentencepiece": "sentencepiece",
     "torch": "torch",
     "transformers": "transformers",
 }
 
 MARIAN_BATCH_SIZE = 8
+OPENVINO_MARIAN_BATCH_SIZE = 1
 NLLB_BATCH_SIZE = 16
 
 
@@ -799,9 +804,10 @@ def _install_marian_openvino_current(
     artifact_dir: Path,
     progress: ProgressCallback | None = None,
 ) -> str:
-    from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
     from transformers import AutoTokenizer  # type: ignore
 
+    _ensure_openvino_python_compatibility()
+    OVModelForSeq2SeqLM = _load_openvino_seq2seq_class()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     _notify(progress, "download", f"Exporting MarianMT model to OpenVINO artifacts for {model_id}.")
     _configure_huggingface_windows_cache()
@@ -877,12 +883,13 @@ def _translate_openvino_seq2seq_bundle(
         return []
     tokenizer = bundle["tokenizer"]
     model = bundle["model"]
-    total_batches = max((len(cues) + MARIAN_BATCH_SIZE - 1) // MARIAN_BATCH_SIZE, 1)
+    batch_size = OPENVINO_MARIAN_BATCH_SIZE
+    total_batches = max((len(cues) + batch_size - 1) // batch_size, 1)
     translations: list[str] = []
     lock: Lock = bundle["lock"]  # type: ignore[assignment]
     with lock:
-        for batch_index, start in enumerate(range(0, len(cues), MARIAN_BATCH_SIZE), start=1):
-            batch = cues[start : start + MARIAN_BATCH_SIZE]
+        for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
+            batch = cues[start : start + batch_size]
             _notify(progress, "translate", f"Translating batch {batch_index}/{total_batches}.")
             encoded = tokenizer(batch, return_tensors="np", padding=True, truncation=True)
             generated = model.generate(**encoded, max_new_tokens=256)
@@ -979,7 +986,7 @@ def _probe_current_runtime(required_modules: tuple[str, ...]) -> PythonRuntime:
     missing = tuple(
         module_name
         for module_name in required_modules
-        if importlib.util.find_spec(module_name) is None
+        if not _module_available(module_name)
     )
     return PythonRuntime(
         executable=sys.executable,
@@ -1048,8 +1055,13 @@ def _probe_python_runtime(executable: str, required_modules: tuple[str, ...]) ->
         return _probe_current_runtime(required_modules)
     probe_code = (
         "import importlib.util,json,sys;"
+        "def module_available(name):\n"
+        "    try:\n"
+        "        return importlib.util.find_spec(name) is not None\n"
+        "    except (ImportError, ModuleNotFoundError, ValueError):\n"
+        "        return False\n"
         "mods=sys.argv[1:];"
-        "missing=[m for m in mods if importlib.util.find_spec(m) is None];"
+        "missing=[m for m in mods if not module_available(m)];"
         "torch_spec=importlib.util.find_spec('torch');"
         "has_cuda=bool(__import__('torch').cuda.is_available()) if torch_spec is not None else False;"
         "print(json.dumps({'missing':missing,'has_cuda':has_cuda}))"
@@ -1076,7 +1088,7 @@ def _probe_python_runtime(executable: str, required_modules: tuple[str, ...]) ->
 
 
 def _ensure_python_packages(packages: list[str], feature_name: str, progress: ProgressCallback | None = None) -> None:
-    missing = [package for package in packages if importlib.util.find_spec(_module_name_for_package(package)) is None]
+    missing = [package for package in packages if not _package_runtime_ready(package)]
     if not missing:
         _notify(progress, "runtime", f"{feature_name} runtime already available in the active interpreter.")
         return
@@ -1245,19 +1257,70 @@ def _argos_path_from_model_id(model_id: str) -> tuple[str, str]:
 
 
 def _hf_runtime_packages() -> list[str]:
-    return ["huggingface-hub", "transformers", "torch", "sentencepiece"]
+    return ["huggingface-hub", "transformers", "torch>=2.7,<2.9", "sentencepiece"]
 
 
 def _ort_runtime_packages() -> list[str]:
-    return ["transformers", "optimum", "onnx", "onnxruntime-directml"]
+    return ["transformers", "sentencepiece", "torch>=2.7,<2.9", "optimum", "onnx", "onnxruntime-directml"]
 
 
 def _openvino_runtime_packages() -> list[str]:
-    return ["transformers", "optimum-intel", "openvino"]
+    return [
+        "transformers>=4.53,<4.54",
+        "sentencepiece>=0.2.0",
+        "torch>=2.7,<2.9",
+        "pillow>=10.0.0",
+        "optimum-intel[openvino]>=1.25.1,<1.26",
+    ]
 
 
 def _module_name_for_package(package: str) -> str:
-    return PACKAGE_MODULES.get(package, package.replace("-", "_"))
+    package_name = _package_name(package)
+    return PACKAGE_MODULES.get(package_name, package_name.replace("-", "_"))
+
+
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _package_name(package: str) -> str:
+    return Requirement(package).name
+
+
+def _package_runtime_ready(package: str) -> bool:
+    package_name = _package_name(package)
+    if not _module_available(_module_name_for_package(package_name)):
+        return False
+    try:
+        installed_version = importlib_metadata.version(package_name)
+    except importlib_metadata.PackageNotFoundError:
+        return False
+    requirement = Requirement(package)
+    if not requirement.specifier:
+        return True
+    return installed_version in requirement.specifier
+
+
+def _ensure_openvino_python_compatibility() -> None:
+    if platform.system().lower() == "windows" and sys.version_info >= (3, 14):
+        raise TranslationError(
+            f"OpenVINO GPU on Windows currently requires Python 3.13 or earlier. "
+            f"Detected Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}."
+        )
+
+
+def _load_openvino_seq2seq_class():
+    try:
+        from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
+
+        return OVModelForSeq2SeqLM
+    except Exception:
+        from optimum.intel.openvino import OVModelForSeq2SeqLM  # type: ignore
+
+        return OVModelForSeq2SeqLM
 
 
 def _notify(progress: ProgressCallback | None, stage: str, message: str) -> None:

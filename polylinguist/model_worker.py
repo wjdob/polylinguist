@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from importlib import metadata as importlib_metadata
+
+from packaging.requirements import Requirement
 
 from polylinguist.services.languages import get_language
 from polylinguist.services.translation import (
     NLLB_BATCH_SIZE,
+    OPENVINO_MARIAN_BATCH_SIZE,
     TranslationError,
     _argos_path_from_model_id,
     _configure_huggingface_windows_cache,
+    _ensure_openvino_python_compatibility,
     _hf_runtime_packages,
     _install_marian_directml_current,
     _install_marian_openvino_current,
+    _load_openvino_seq2seq_class,
     _module_name_for_package,
     _openvino_runtime_packages,
     _ort_runtime_packages,
@@ -123,6 +129,7 @@ def install_marian_directml(model_id: str, artifact_dir: str) -> str:
 
 
 def install_marian_openvino(model_id: str, artifact_dir: str) -> str:
+    _ensure_openvino_python_compatibility()
     ensure_runtime_packages(_openvino_runtime_packages())
     return _install_marian_openvino_current(model_id, Path(artifact_dir), emit)
 
@@ -191,7 +198,7 @@ def translate_marian_directml(artifact_dir: str, model_id: str, target_lang: str
     emit("load", f"Loading DirectML session for {artifact_dir}.")
     model = ORTModelForSeq2SeqLM.from_pretrained(artifact_dir, provider="DmlExecutionProvider")
     emit("load", "Model loaded on directml.")
-    batch_size = 8
+    batch_size = OPENVINO_MARIAN_BATCH_SIZE
     total_batches = max((len(cues) + batch_size - 1) // batch_size, 1)
     translations: list[str] = []
     for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
@@ -205,11 +212,12 @@ def translate_marian_directml(artifact_dir: str, model_id: str, target_lang: str
 
 
 def translate_marian_openvino(artifact_dir: str, model_id: str, target_lang: str, cues: list[str]) -> list[str]:
-    from optimum.intel import OVModelForSeq2SeqLM  # type: ignore
     from transformers import AutoTokenizer  # type: ignore
 
     if not cues:
         return []
+    _ensure_openvino_python_compatibility()
+    OVModelForSeq2SeqLM = _load_openvino_seq2seq_class()
     emit("load", f"Loading tokenizer for {artifact_dir}.")
     tokenizer = AutoTokenizer.from_pretrained(artifact_dir)
     emit("load", f"Loading OpenVINO model for {artifact_dir}.")
@@ -276,7 +284,26 @@ def ensure_runtime_packages(packages: list[str]) -> None:
     import importlib.util
     import subprocess
 
-    missing = [package for package in packages if importlib.util.find_spec(_module_name_for_package(package)) is None]
+    def module_available(name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return False
+
+    def package_ready(package: str) -> bool:
+        requirement = Requirement(package)
+        module_name = _module_name_for_package(requirement.name)
+        if not module_available(module_name):
+            return False
+        try:
+            installed_version = importlib_metadata.version(requirement.name)
+        except importlib_metadata.PackageNotFoundError:
+            return False
+        if not requirement.specifier:
+            return True
+        return installed_version in requirement.specifier
+
+    missing = [package for package in packages if not package_ready(package)]
     if not missing:
         return
     subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)

@@ -4,8 +4,15 @@ import sys
 from polylinguist.services.translation import (
     _discover_python_executables,
     _ensure_python_packages,
+    _ensure_openvino_python_compatibility,
     _configure_huggingface_windows_cache,
+    _load_openvino_seq2seq_class,
+    _package_name,
+    _package_runtime_ready,
+    _module_available,
     _module_name_for_package,
+    _openvino_runtime_packages,
+    _ort_runtime_packages,
     _resolve_device_preference,
     _resolve_runtime,
     _wrap_huggingface_windows_privilege_error,
@@ -15,9 +22,20 @@ from polylinguist.services.translation import (
 
 def test_module_name_mapping():
     assert _module_name_for_package("huggingface-hub") == "huggingface_hub"
+    assert _module_name_for_package("pillow") == "PIL"
     assert _module_name_for_package("sentencepiece") == "sentencepiece"
     assert _module_name_for_package("onnxruntime-directml") == "onnxruntime"
     assert _module_name_for_package("optimum-intel") == "optimum.intel"
+    assert _module_name_for_package("optimum-intel[openvino]>=1.25.1,<1.26") == "optimum.intel"
+
+
+def test_package_name_strips_specifiers_and_extras():
+    assert _package_name("optimum-intel[openvino]>=1.25.1,<1.26") == "optimum-intel"
+
+
+def test_gpu_runtime_packages_include_sentencepiece():
+    assert "sentencepiece" in _ort_runtime_packages()
+    assert any(package.startswith("sentencepiece") for package in _openvino_runtime_packages())
 
 
 def test_bootstrap_skips_when_modules_exist(monkeypatch):
@@ -35,6 +53,52 @@ def test_bootstrap_skips_when_modules_exist(monkeypatch):
 
     _ensure_python_packages(["huggingface-hub", "transformers"], "MarianMT")
     assert calls == []
+
+
+def test_module_available_handles_missing_parent_package(monkeypatch):
+    def fake_find_spec(name):
+        if name == "optimum.intel":
+            raise ModuleNotFoundError("No module named 'optimum'")
+        return object()
+
+    monkeypatch.setattr("polylinguist.services.translation.importlib.util.find_spec", fake_find_spec)
+
+    assert _module_available("optimum.intel") is False
+
+
+def test_package_runtime_ready_detects_incompatible_version(monkeypatch):
+    monkeypatch.setattr("polylinguist.services.translation._module_available", lambda module_name: True)
+    monkeypatch.setattr("polylinguist.services.translation.importlib_metadata.version", lambda package_name: "4.57.6")
+
+    assert _package_runtime_ready("transformers>=4.53,<4.54") is False
+
+
+def test_openvino_python_compatibility_rejects_windows_python_314(monkeypatch):
+    monkeypatch.setattr("polylinguist.services.translation.platform.system", lambda: "Windows")
+    version_info = type("VersionInfo", (), {"major": 3, "minor": 14, "micro": 1, "__ge__": lambda self, other: (3, 14, 1) >= other})()
+    monkeypatch.setattr("polylinguist.services.translation.sys.version_info", version_info)
+
+    try:
+        _ensure_openvino_python_compatibility()
+    except TranslationError as exc:
+        assert "Python 3.13 or earlier" in str(exc)
+    else:
+        raise AssertionError("Expected TranslationError for Windows Python 3.14 OpenVINO.")
+
+
+def test_load_openvino_seq2seq_class_falls_back_to_openvino_submodule(monkeypatch):
+    original_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "optimum.intel":
+            raise ImportError("top-level import unavailable")
+        if name == "optimum.intel.openvino":
+            return type("Module", (), {"OVModelForSeq2SeqLM": object()})()
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    assert _load_openvino_seq2seq_class() is not None
 
 
 def test_discovery_includes_current_python():

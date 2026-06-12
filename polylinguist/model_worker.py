@@ -10,6 +10,7 @@ from packaging.requirements import Requirement
 from polylinguist.services.languages import get_language
 from polylinguist.services.translation import (
     NLLB_BATCH_SIZE,
+    NLLB_MAX_NEW_TOKENS,
     OPENVINO_MARIAN_BATCH_SIZE,
     TranslationError,
     _argos_path_from_model_id,
@@ -275,6 +276,7 @@ def translate_nllb(model_id: str, source_lang: str, target_lang: str, cues: list
             generated = model.generate(
                 **encoded,
                 forced_bos_token_id=forced_bos_token_id,
+                max_new_tokens=NLLB_MAX_NEW_TOKENS,
             )
             translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
     return translations

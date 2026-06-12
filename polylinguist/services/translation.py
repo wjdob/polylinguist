@@ -44,6 +44,7 @@ PACKAGE_MODULES = {
 MARIAN_BATCH_SIZE = 8
 OPENVINO_MARIAN_BATCH_SIZE = 1
 NLLB_BATCH_SIZE = 16
+NLLB_MAX_NEW_TOKENS = 256
 
 
 def _configure_huggingface_windows_cache() -> None:
@@ -661,7 +662,11 @@ class NllbTranslator(TranslatorAdapter):
                         encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
                         if device != "cpu":
                             encoded = {key: value.to(device) for key, value in encoded.items()}
-                        generated = model.generate(**encoded, forced_bos_token_id=forced_bos_token_id)
+                        generated = model.generate(
+                            **encoded,
+                            forced_bos_token_id=forced_bos_token_id,
+                            max_new_tokens=NLLB_MAX_NEW_TOKENS,
+                        )
                         translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
             return translations
         _notify(progress, "runtime", f"Using NLLB worker runtime: {runtime_executable}")

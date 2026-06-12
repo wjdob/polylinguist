@@ -13,6 +13,7 @@ from polylinguist.services.languages import language_label
 _TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})"
 )
+_PUNCTUATION_ONLY_RE = re.compile(r"^[\s,.;:!?_\-+=~`'\"()\[\]{}<>\\/|*]+$")
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,15 @@ class SubtitleCandidate:
     score: float
     format: str = "srt"
     match_label: str = "match"
+
+
+@dataclass(frozen=True)
+class PreparedTranslationBatch:
+    cues: list[str]
+    active_indices: list[int]
+    active_cues: list[str]
+    sanitized_count: int
+    skipped_count: int
 
 
 def parse_subtitle_text(content: str) -> list[SubtitleCue]:
@@ -70,6 +80,31 @@ def subtitle_menu_label(candidate: SubtitleCandidate, settings: AddonSettings, p
     src = language_label(settings.source_lang)
     tgt = language_label(settings.target_lang)
     return f"Dual {src}+{tgt} - {provider_label} - {candidate.match_label} #{index}"
+
+
+def prepare_translation_batch(texts: list[str]) -> PreparedTranslationBatch:
+    cues: list[str] = []
+    active_indices: list[int] = []
+    active_cues: list[str] = []
+    sanitized_count = 0
+    skipped_count = 0
+    for index, text in enumerate(texts):
+        prepared, changed = _prepare_translation_text(text)
+        if changed:
+            sanitized_count += 1
+        cues.append(prepared)
+        if prepared:
+            active_indices.append(index)
+            active_cues.append(prepared)
+        else:
+            skipped_count += 1
+    return PreparedTranslationBatch(
+        cues=cues,
+        active_indices=active_indices,
+        active_cues=active_cues,
+        sanitized_count=sanitized_count,
+        skipped_count=skipped_count,
+    )
 
 
 def encode_subtitle_payload(payload: dict[str, str]) -> str:
@@ -154,6 +189,31 @@ def _normalize_cue_text(text: str) -> str:
     cleaned = re.sub(r"\{[^}]+\}", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned.replace("\n", " ")).strip()
     return html.escape(cleaned, quote=False)
+
+
+def _prepare_translation_text(text: str) -> tuple[str, bool]:
+    if not text:
+        return "", False
+    changed = False
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        cleaned = re.sub(r"<[^>]+>", "", stripped)
+        cleaned = re.sub(r"\{[^}]+\}", "", cleaned).strip()
+        if cleaned != stripped:
+            changed = True
+        if not cleaned:
+            if stripped:
+                changed = True
+            continue
+        if len(cleaned) >= 12 and _PUNCTUATION_ONLY_RE.fullmatch(cleaned):
+            changed = True
+            continue
+        lines.append(cleaned)
+    prepared = "\n".join(lines).strip()
+    if prepared != text.strip():
+        changed = True
+    return prepared, changed
 
 
 def _from_timestamp(timestamp: str) -> int:

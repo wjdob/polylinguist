@@ -20,3 +20,21 @@ def hf_model_cache_exists(model_id: str) -> bool:
     snapshots_dir = cache_dir / "snapshots"
     refs_dir = cache_dir / "refs"
     return (snapshots_dir.exists() and any(snapshots_dir.iterdir())) or (refs_dir.exists() and any(refs_dir.iterdir()))
+
+
+def local_model_artifact_dir(root: Path, provider: str, model_id: str, target: str) -> Path:
+    return root / provider / target / _slugify_model_id(model_id)
+
+
+def local_model_artifact_exists(root: Path, provider: str, model_id: str, target: str) -> bool:
+    artifact_dir = local_model_artifact_dir(root, provider, model_id, target)
+    return artifact_dir.exists() and any(artifact_dir.iterdir())
+
+
+def _slugify_model_id(model_id: str) -> str:
+    return (
+        model_id.replace("\\", "__")
+        .replace("/", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import shutil
 
 
 class SubtitleCache:
@@ -28,3 +29,8 @@ class SubtitleCache:
         with path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(content)
         return path
+
+    def clear(self) -> None:
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)

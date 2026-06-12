@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sys
+from importlib import metadata as importlib_metadata
+
+from packaging.requirements import Requirement
 
 from polylinguist.services.languages import get_language
 from polylinguist.services.translation import (
     NLLB_BATCH_SIZE,
+    NLLB_MAX_NEW_TOKENS,
+    OPENVINO_MARIAN_BATCH_SIZE,
     TranslationError,
     _argos_path_from_model_id,
+    _configure_huggingface_windows_cache,
+    _ensure_openvino_python_compatibility,
     _hf_runtime_packages,
+    _install_marian_directml_current,
+    _install_marian_openvino_current,
+    _load_openvino_seq2seq_class,
+    _module_name_for_package,
+    _openvino_runtime_packages,
+    _ort_runtime_packages,
     _prepare_marian_batch,
     _resolve_device_preference,
+    _wrap_huggingface_windows_privilege_error,
 )
 
 
@@ -30,6 +45,10 @@ def dispatch(command: str, payload: dict[str, object]) -> object:
         return install_argos(str(payload["model_id"]), str(payload.get("install_strategy", "direct")))
     if command == "install-hf":
         return install_hf(str(payload["model_id"]))
+    if command == "install-marian-directml":
+        return install_marian_directml(str(payload["model_id"]), str(payload["artifact_dir"]))
+    if command == "install-marian-openvino":
+        return install_marian_openvino(str(payload["model_id"]), str(payload["artifact_dir"]))
     if command == "translate-argos":
         return translate_argos(
             str(payload["model_id"]),
@@ -41,6 +60,20 @@ def dispatch(command: str, payload: dict[str, object]) -> object:
             str(payload.get("target_lang", "")),
             list(payload.get("cues", [])),
             str(payload.get("device_preference", "auto")),
+        )
+    if command == "translate-marian-directml":
+        return translate_marian_directml(
+            str(payload["artifact_dir"]),
+            str(payload["model_id"]),
+            str(payload.get("target_lang", "")),
+            list(payload.get("cues", [])),
+        )
+    if command == "translate-marian-openvino":
+        return translate_marian_openvino(
+            str(payload["artifact_dir"]),
+            str(payload["model_id"]),
+            str(payload.get("target_lang", "")),
+            list(payload.get("cues", [])),
         )
     if command == "translate-nllb":
         return translate_nllb(
@@ -80,9 +113,26 @@ def install_argos(model_id: str, install_strategy: str) -> str:
 def install_hf(model_id: str) -> str:
     from huggingface_hub import snapshot_download  # type: ignore
 
+    _configure_huggingface_windows_cache()
     emit("download", f"Downloading model weights for {model_id}.")
-    location = snapshot_download(repo_id=model_id)
+    if sys.platform.startswith("win"):
+        emit("runtime", "Windows detected; using Hugging Face no-symlink cache mode.")
+    try:
+        location = snapshot_download(repo_id=model_id)
+    except OSError as exc:
+        _wrap_huggingface_windows_privilege_error(exc)
     return f"Downloaded {model_id} to {location}"
+
+
+def install_marian_directml(model_id: str, artifact_dir: str) -> str:
+    ensure_runtime_packages(_ort_runtime_packages())
+    return _install_marian_directml_current(model_id, Path(artifact_dir), emit)
+
+
+def install_marian_openvino(model_id: str, artifact_dir: str) -> str:
+    _ensure_openvino_python_compatibility()
+    ensure_runtime_packages(_openvino_runtime_packages())
+    return _install_marian_openvino_current(model_id, Path(artifact_dir), emit)
 
 
 def translate_argos(model_id: str, cues: list[str]) -> list[str]:
@@ -138,6 +188,63 @@ def translate_marian(model_id: str, target_lang: str, cues: list[str], device_pr
     return translations
 
 
+def translate_marian_directml(artifact_dir: str, model_id: str, target_lang: str, cues: list[str]) -> list[str]:
+    from optimum.onnxruntime import ORTModelForSeq2SeqLM  # type: ignore
+    from transformers import AutoTokenizer  # type: ignore
+
+    if not cues:
+        return []
+    emit("load", f"Loading tokenizer for {artifact_dir}.")
+    tokenizer = AutoTokenizer.from_pretrained(artifact_dir)
+    emit("load", f"Loading DirectML session for {artifact_dir}.")
+    model = ORTModelForSeq2SeqLM.from_pretrained(artifact_dir, provider="DmlExecutionProvider")
+    emit("load", "Model loaded on directml.")
+    batch_size = OPENVINO_MARIAN_BATCH_SIZE
+    total_batches = max((len(cues) + batch_size - 1) // batch_size, 1)
+    translations: list[str] = []
+    for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
+        batch = cues[start : start + batch_size]
+        batch = _prepare_marian_batch(model_id, target_lang, batch)
+        emit("translate", f"Translating batch {batch_index}/{total_batches}.")
+        encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+        generated = model.generate(**encoded, max_new_tokens=256)
+        translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    return translations
+
+
+def translate_marian_openvino(artifact_dir: str, model_id: str, target_lang: str, cues: list[str]) -> list[str]:
+    from transformers import AutoTokenizer  # type: ignore
+
+    if not cues:
+        return []
+    _ensure_openvino_python_compatibility()
+    OVModelForSeq2SeqLM = _load_openvino_seq2seq_class()
+    emit("load", f"Loading tokenizer for {artifact_dir}.")
+    tokenizer = AutoTokenizer.from_pretrained(artifact_dir)
+    emit("load", f"Loading OpenVINO model for {artifact_dir}.")
+    model = OVModelForSeq2SeqLM.from_pretrained(
+        artifact_dir,
+        device="gpu",
+        compile=False,
+        ov_config={"CACHE_DIR": str(Path(artifact_dir) / "model_cache")},
+    )
+    emit("compile", "Compiling OpenVINO GPU graph.")
+    model.to("gpu")
+    model.compile()
+    emit("load", "Model loaded on openvino_gpu.")
+    batch_size = 8
+    total_batches = max((len(cues) + batch_size - 1) // batch_size, 1)
+    translations: list[str] = []
+    for batch_index, start in enumerate(range(0, len(cues), batch_size), start=1):
+        batch = cues[start : start + batch_size]
+        batch = _prepare_marian_batch(model_id, target_lang, batch)
+        emit("translate", f"Translating batch {batch_index}/{total_batches}.")
+        encoded = tokenizer(batch, return_tensors="np", padding=True, truncation=True)
+        generated = model.generate(**encoded, max_new_tokens=256)
+        translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+    return translations
+
+
 def translate_nllb(model_id: str, source_lang: str, target_lang: str, cues: list[str], device_preference: str) -> list[str]:
     import torch  # type: ignore
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
@@ -169,9 +276,39 @@ def translate_nllb(model_id: str, source_lang: str, target_lang: str, cues: list
             generated = model.generate(
                 **encoded,
                 forced_bos_token_id=forced_bos_token_id,
+                max_new_tokens=NLLB_MAX_NEW_TOKENS,
             )
             translations.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
     return translations
+
+
+def ensure_runtime_packages(packages: list[str]) -> None:
+    import importlib.util
+    import subprocess
+
+    def module_available(name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return False
+
+    def package_ready(package: str) -> bool:
+        requirement = Requirement(package)
+        module_name = _module_name_for_package(requirement.name)
+        if not module_available(module_name):
+            return False
+        try:
+            installed_version = importlib_metadata.version(requirement.name)
+        except importlib_metadata.PackageNotFoundError:
+            return False
+        if not requirement.specifier:
+            return True
+        return installed_version in requirement.specifier
+
+    missing = [package for package in packages if not package_ready(package)]
+    if not missing:
+        return
+    subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)
 
 
 def emit(stage: str, message: str) -> None:

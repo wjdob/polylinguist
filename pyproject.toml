@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
+    "packaging>=24.0",
     "pydantic>=2.9.0",
     "uvicorn>=0.32.0",
 ]
@@ -19,9 +20,15 @@ dependencies = [
 models = [
     "argostranslate>=1.9.6",
     "huggingface-hub>=0.30.0",
+    "pillow>=10.0.0",
     "sentencepiece>=0.2.0",
     "transformers>=4.51.0",
-    "torch>=2.7.0",
+    "torch>=2.7",
+]
+windows-gpu = [
+    "onnx>=1.17.0",
+    "onnxruntime-directml>=1.20.0",
+    "optimum-intel[openvino]>=1.25.1,<1.26",
 ]
 system = [
     "psutil>=6.0.0",
@@ -33,6 +40,7 @@ dev = [
 
 [project.scripts]
 polylinguist = "polylinguist.main:main"
+polylinguist-uninstall = "polylinguist.uninstall:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

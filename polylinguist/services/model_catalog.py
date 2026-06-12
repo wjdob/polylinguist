@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from polylinguist.schemas import ModelCatalogResponse, ModelOptionResponse
+from polylinguist.services.compatibility import (
+    machine_target_block_reason,
+    provider_target_block_reason,
+    system_target_block_reason,
+    target_label,
+)
 from polylinguist.services.languages import get_language, normalize_language
-from polylinguist.services.local_models import hf_model_cache_exists
+from polylinguist.services.local_models import hf_model_cache_exists, local_model_artifact_exists
 from polylinguist.services.model_registry import InstalledModelRegistry
+from polylinguist.services.runtime_support import compatible_runtime_block_reason
 from polylinguist.services.system_profile import SystemProfile
 
 
@@ -56,24 +64,35 @@ class ModelDescriptor:
     available: bool
     direct: bool
     installed: bool
+    installed_targets: tuple[str, ...]
+    supported_targets: tuple[str, ...]
+    recommended_target: str | None = None
+    availability_reason: str | None = None
     note: str | None = None
     license: str | None = None
     install_strategy: str = "direct"
 
 
 class ModelCatalogService:
-    def __init__(self, metadata_cache_file: Path, registry: InstalledModelRegistry) -> None:
+    def __init__(self, metadata_cache_file: Path, registry: InstalledModelRegistry, model_artifacts_dir: Path) -> None:
         self.metadata_cache_file = metadata_cache_file
         self.registry = registry
+        self.model_artifacts_dir = model_artifacts_dir
 
-    def list_models(self, source_lang: str, target_lang: str, profile: SystemProfile) -> ModelCatalogResponse:
+    def list_models(
+        self,
+        source_lang: str,
+        target_lang: str,
+        profile: SystemProfile,
+        refresh: bool = False,
+    ) -> ModelCatalogResponse:
         source = normalize_language(source_lang) or source_lang
         target = normalize_language(target_lang) or target_lang
 
         descriptors: list[ModelDescriptor] = []
-        descriptors.extend(self._argos_descriptors(source, target))
-        descriptors.extend(self._marian_descriptors(source, target))
-        descriptors.extend(self._nllb_descriptors(source, target))
+        descriptors.extend(self._argos_descriptors(source, target, refresh))
+        descriptors.extend(self._marian_descriptors(source, target, profile, refresh))
+        descriptors.extend(self._nllb_descriptors(source, target, profile))
 
         recommended = self.recommend(source, target, profile, descriptors)
         models = [
@@ -87,6 +106,10 @@ class ModelCatalogService:
                 available=item.available,
                 direct=item.direct,
                 installed=item.installed,
+                installed_targets=list(item.installed_targets),
+                supported_targets=list(item.supported_targets),
+                recommended_target=item.recommended_target,
+                availability_reason=item.availability_reason,
                 note=item.note,
                 license=item.license,
                 recommended=bool(recommended and recommended.provider == item.provider and recommended.model_id == item.model_id),
@@ -127,16 +150,60 @@ class ModelCatalogService:
             return pick("marian") or pick("argos") or pick("nllb")
         return pick("marian") or pick("nllb") or pick("argos")
 
-    def _argos_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
+    def validate_processing_target(
+        self,
+        profile: SystemProfile,
+        provider: str,
+        model_id: str,
+        source_lang: str,
+        target_lang: str,
+        processing_device: str,
+    ) -> tuple[bool, str | None]:
+        response = self.list_models(source_lang, target_lang, profile)
+        model = next(
+            (item for item in response.models if item.provider == provider and item.model_id == model_id),
+            None,
+        )
+        if model is None:
+            return False, "Requested model is not available for this language pair."
+        if not model.available:
+            return False, model.availability_reason or "Requested model is unavailable."
+        normalized = (processing_device or "auto").lower()
+        if normalized == "auto":
+            return True, None
+        provider_reason = provider_target_block_reason(provider, normalized)
+        if provider_reason:
+            return False, provider_reason
+        system_reason = system_target_block_reason(normalized, system_name=profile.os)
+        if system_reason:
+            return False, system_reason
+        machine_reason = machine_target_block_reason(profile, normalized)
+        if machine_reason:
+            return False, machine_reason
+        runtime_reason = self._runtime_target_block_reason(profile, provider, normalized)
+        if runtime_reason:
+            return False, runtime_reason
+        if normalized not in model.supported_targets:
+            supported = ", ".join(model.supported_targets) or "none"
+            return False, f"{model.label} does not support {target_label(normalized)}. Supported targets: {supported}."
+        return True, None
+
+    def _argos_descriptors(self, source_lang: str, target_lang: str, refresh: bool = False) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
         if not source or not target or not source.iso639_1 or not target.iso639_1:
             return []
 
-        pairs = self._load_argos_index()
+        pairs, checked_at, metadata_source = self._load_argos_index(refresh)
         direct_key = (source.iso639_1, target.iso639_1)
         pivot_source_key = (source.iso639_1, "en")
         pivot_target_key = ("en", target.iso639_1)
+        metadata_note = self._metadata_note(
+            None,
+            checked_at=checked_at,
+            metadata_source=metadata_source,
+            offline_hint="Argos metadata is using the built-in fallback list until refreshed online.",
+        )
 
         direct = pairs.get(direct_key)
         if direct:
@@ -152,7 +219,16 @@ class ModelCatalogService:
                     available=True,
                     direct=True,
                     installed=self.registry.is_installed("argos", model_id),
-                    note="Smallest offline option.",
+                    installed_targets=("cpu",) if self.registry.is_installed("argos", model_id) else (),
+                    supported_targets=("cpu",),
+                    recommended_target="cpu",
+                    availability_reason="Direct Argos package available.",
+                    note=self._metadata_note(
+                        "Smallest offline option.",
+                        checked_at=checked_at,
+                        metadata_source=metadata_source,
+                        offline_hint="Argos metadata is using the built-in fallback list until refreshed online.",
+                    ),
                     license="MIT",
                 )
             ]
@@ -171,7 +247,16 @@ class ModelCatalogService:
                     available=True,
                     direct=False,
                     installed=self.registry.is_installed("argos", model_id),
-                    note="Uses English pivot because no direct Argos pair is indexed.",
+                    installed_targets=("cpu",) if self.registry.is_installed("argos", model_id) else (),
+                    supported_targets=("cpu",),
+                    recommended_target="cpu",
+                    availability_reason="Argos pair available through an English pivot.",
+                    note=self._metadata_note(
+                        "Uses English pivot because no direct Argos pair is indexed.",
+                        checked_at=checked_at,
+                        metadata_source=metadata_source,
+                        offline_hint="Argos metadata is using the built-in fallback list until refreshed online.",
+                    ),
                     license="MIT",
                     install_strategy="pivot",
                 )
@@ -188,25 +273,44 @@ class ModelCatalogService:
                 available=False,
                 direct=True,
                 installed=False,
-                note="No direct or pivot package found in the Argos index.",
+                installed_targets=(),
+                supported_targets=("cpu",),
+                recommended_target="cpu",
+                availability_reason="No direct or pivot package found in the Argos index.",
+                note=metadata_note or "No direct or pivot package found in the Argos index.",
                 license="MIT",
             )
         ]
 
-    def _marian_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
+    def _marian_descriptors(
+        self,
+        source_lang: str,
+        target_lang: str,
+        profile: SystemProfile,
+        refresh: bool = False,
+    ) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
         if not source or not target or not source.marian_code or not target.marian_code:
             return []
 
         model_id = f"Helsinki-NLP/opus-mt-{source.marian_code}-{target.marian_code}"
-        available = self._probe_huggingface_model(model_id)
+        available, checked_at, metadata_source = self._probe_huggingface_model(model_id, refresh)
         direct = True
         note = "CPU-friendly default when a direct pair exists."
         if not available and source_lang == "eng" and target_lang in MARIAN_ENGLISH_FALLBACKS:
             model_id, note = MARIAN_ENGLISH_FALLBACKS[target_lang]
-            available = self._probe_huggingface_model(model_id)
+            available, checked_at, metadata_source = self._probe_huggingface_model(model_id, refresh)
             direct = False
+        supported_targets = self._marian_supported_targets(profile)
+        recommended_target = self._preferred_accelerated_target(profile, supported_targets)
+        installed_targets = self._installed_targets_for_marian(model_id)
+        if available:
+            availability_reason = "MarianMT supports this language pair."
+        elif metadata_source == "heuristic":
+            availability_reason = "MarianMT availability is unverified offline. Refresh model metadata when online."
+        else:
+            availability_reason = "No MarianMT route was found for this language pair."
         return [
             ModelDescriptor(
                 provider="marian",
@@ -217,16 +321,27 @@ class ModelCatalogService:
                 size_mb=320,
                 available=available,
                 direct=direct,
-                installed=self._is_effectively_installed("marian", model_id),
-                note=note,
+                installed=bool(installed_targets),
+                installed_targets=installed_targets,
+                supported_targets=supported_targets,
+                recommended_target=recommended_target,
+                availability_reason=availability_reason,
+                note=self._metadata_note(
+                    note,
+                    checked_at=checked_at,
+                    metadata_source=metadata_source,
+                    offline_hint="Marian model availability is using an offline heuristic until refreshed online.",
+                ),
                 license="Apache-2.0",
             )
         ]
 
-    def _nllb_descriptors(self, source_lang: str, target_lang: str) -> list[ModelDescriptor]:
+    def _nllb_descriptors(self, source_lang: str, target_lang: str, profile: SystemProfile) -> list[ModelDescriptor]:
         source = get_language(source_lang)
         target = get_language(target_lang)
         available = bool(source and target and source.nllb_code and target.nllb_code)
+        installed_targets = self._installed_targets_for_nllb(NLLB_MODEL_ID)
+        supported_targets = tuple(self._nllb_supported_targets(source_lang, target_lang, profile))
         return [
             ModelDescriptor(
                 provider="nllb",
@@ -237,26 +352,37 @@ class ModelCatalogService:
                 size_mb=NLLB_SIZE_MB,
                 available=available,
                 direct=True,
-                installed=self._is_effectively_installed("nllb", NLLB_MODEL_ID),
+                installed=bool(installed_targets),
+                installed_targets=installed_targets,
+                supported_targets=supported_targets,
+                recommended_target="cuda" if "cuda" in supported_targets else "cpu",
+                availability_reason="NLLB supports this language pair." if available else "NLLB language codes are missing for this pair.",
                 note="Universal multilingual fallback. Larger and slower on CPU.",
                 license="CC-BY-NC-4.0",
             )
         ]
 
-    def _load_argos_index(self) -> dict[tuple[str, str], int]:
+    def _load_argos_index(self, refresh: bool = False) -> tuple[dict[tuple[str, str], int], str | None, str]:
         cached = self._read_metadata_cache()
         argos_pairs = cached.get("argos_pairs")
         if isinstance(argos_pairs, dict) and argos_pairs:
-            return {(key.split("->")[0], key.split("->")[1]): value for key, value in argos_pairs.items()}
+            parsed = {(key.split("->")[0], key.split("->")[1]): value for key, value in argos_pairs.items()}
+            if not refresh:
+                return parsed, self._coerce_timestamp(cached.get("argos_pairs_updated_at")), "cached"
 
-        pairs = self._fetch_argos_index()
-        self._write_metadata_cache(
-            {
-                **cached,
-                "argos_pairs": {f"{src}->{tgt}": size for (src, tgt), size in pairs.items()},
-            }
-        )
-        return pairs
+        if refresh:
+            pairs = self._fetch_argos_index()
+            checked_at = _utc_now_iso()
+            self._write_metadata_cache(
+                {
+                    **cached,
+                    "argos_pairs": {f"{src}->{tgt}": size for (src, tgt), size in pairs.items()},
+                    "argos_pairs_updated_at": checked_at,
+                }
+            )
+            return pairs, checked_at, "refreshed"
+
+        return self._fallback_argos_index(), self._coerce_timestamp(cached.get("argos_pairs_updated_at")), "fallback"
 
     def _fetch_argos_index(self) -> dict[tuple[str, str], int]:
         try:
@@ -275,6 +401,10 @@ class ModelCatalogService:
         except Exception:
             pass
 
+        return self._fallback_argos_index()
+
+    @staticmethod
+    def _fallback_argos_index() -> dict[tuple[str, str], int]:
         # Fallback keeps the install UI useful when the remote index is unavailable.
         return {
             ("en", "es"): 82,
@@ -293,22 +423,27 @@ class ModelCatalogService:
             ("tr", "en"): 101,
         }
 
-    def _probe_huggingface_model(self, model_id: str) -> bool:
+    def _probe_huggingface_model(self, model_id: str, refresh: bool = False) -> tuple[bool, str | None, str]:
         cached = self._read_metadata_cache()
-        probe_map = cached.get("hf_models")
-        if isinstance(probe_map, dict) and model_id in probe_map:
-            return bool(probe_map[model_id])
+        cached_exists, cached_checked_at = self._cached_hf_probe(cached, model_id)
+        if cached_exists is not None and not refresh:
+            return cached_exists, cached_checked_at, "cached"
 
-        try:
-            response = httpx.get(f"https://huggingface.co/api/models/{model_id}", timeout=10.0)
-            exists = response.status_code == 200
-        except Exception:
-            exists = False
+        if refresh:
+            try:
+                response = httpx.get(f"https://huggingface.co/api/models/{model_id}", timeout=10.0)
+                exists = response.status_code == 200
+                checked_at = _utc_now_iso()
+                probe_map = cached.get("hf_models")
+                probe_map = probe_map if isinstance(probe_map, dict) else {}
+                probe_map[model_id] = {"exists": exists, "checked_at": checked_at}
+                self._write_metadata_cache({**cached, "hf_models": probe_map})
+                return exists, checked_at, "refreshed"
+            except Exception:
+                if cached_exists is not None:
+                    return cached_exists, cached_checked_at, "cached"
 
-        probe_map = probe_map if isinstance(probe_map, dict) else {}
-        probe_map[model_id] = exists
-        self._write_metadata_cache({**cached, "hf_models": probe_map})
-        return exists
+        return self._offline_hf_heuristic(model_id), cached_checked_at, "heuristic"
 
     def _read_metadata_cache(self) -> dict[str, object]:
         if not self.metadata_cache_file.exists():
@@ -324,3 +459,116 @@ class ModelCatalogService:
         if provider in {"marian", "nllb"}:
             return hf_model_cache_exists(model_id)
         return False
+
+    def _marian_supported_targets(self, profile: SystemProfile) -> tuple[str, ...]:
+        targets = ["cpu"]
+        if self._target_supported(profile, "marian", "cuda"):
+            targets.append("cuda")
+        if self._target_supported(profile, "marian", "openvino_gpu"):
+            targets.append("openvino_gpu")
+        if self._target_supported(profile, "marian", "directml"):
+            targets.append("directml")
+        return tuple(targets)
+
+    def _nllb_supported_targets(self, source_lang: str, target_lang: str, profile: SystemProfile) -> list[str]:
+        source = get_language(source_lang)
+        target = get_language(target_lang)
+        if not source or not target or not source.nllb_code or not target.nllb_code:
+            return []
+        targets = ["cpu"]
+        if self._target_supported(profile, "nllb", "cuda"):
+            targets.append("cuda")
+        return targets
+
+    @staticmethod
+    def _preferred_accelerated_target(profile: SystemProfile, supported_targets: tuple[str, ...]) -> str:
+        for target in ("cuda", "openvino_gpu", "directml", "cpu"):
+            if target in supported_targets and (target == "cpu" or profile.supports_target(target)):
+                return target
+        return "cpu"
+
+    def _target_supported(self, profile: SystemProfile, provider: str, target: str) -> bool:
+        return self._target_block_reason(profile, provider, target) is None
+
+    def _runtime_target_block_reason(self, profile: SystemProfile, provider: str, target: str) -> str | None:
+        if provider_target_block_reason(provider, target):
+            return None
+        return compatible_runtime_block_reason(target, system_name=profile.os)
+
+    def _target_block_reason(self, profile: SystemProfile, provider: str, target: str) -> str | None:
+        provider_reason = provider_target_block_reason(provider, target)
+        if provider_reason:
+            return provider_reason
+        system_reason = system_target_block_reason(target, system_name=profile.os)
+        if system_reason:
+            return system_reason
+        machine_reason = machine_target_block_reason(profile, target)
+        if machine_reason:
+            return machine_reason
+        return self._runtime_target_block_reason(profile, provider, target)
+
+    def _installed_targets_for_marian(self, model_id: str) -> tuple[str, ...]:
+        installed = set(self.registry.installed_targets("marian", model_id))
+        if not self.registry.is_removed("marian", model_id) and (
+            self.registry.is_installed("marian", model_id) or hf_model_cache_exists(model_id)
+        ):
+            installed.update({"cpu", "cuda"})
+        if not self.registry.is_removed("marian", model_id, "directml") and local_model_artifact_exists(
+            self.model_artifacts_dir, "marian", model_id, "directml"
+        ):
+            installed.add("directml")
+        if not self.registry.is_removed("marian", model_id, "openvino_gpu") and local_model_artifact_exists(
+            self.model_artifacts_dir, "marian", model_id, "openvino_gpu"
+        ):
+            installed.add("openvino_gpu")
+        return tuple(sorted(installed))
+
+    def _installed_targets_for_nllb(self, model_id: str) -> tuple[str, ...]:
+        installed = set(self.registry.installed_targets("nllb", model_id))
+        if not self.registry.is_removed("nllb", model_id) and (
+            self.registry.is_installed("nllb", model_id) or hf_model_cache_exists(model_id)
+        ):
+            installed.update({"cpu", "cuda"})
+        return tuple(sorted(installed))
+
+    @staticmethod
+    def _cached_hf_probe(cached: dict[str, object], model_id: str) -> tuple[bool | None, str | None]:
+        probe_map = cached.get("hf_models")
+        if not isinstance(probe_map, dict) or model_id not in probe_map:
+            return None, None
+        payload = probe_map[model_id]
+        if isinstance(payload, bool):
+            return payload, None
+        if isinstance(payload, dict):
+            return bool(payload.get("exists")), ModelCatalogService._coerce_timestamp(payload.get("checked_at"))
+        return None, None
+
+    @staticmethod
+    def _offline_hf_heuristic(model_id: str) -> bool:
+        return model_id == NLLB_MODEL_ID or model_id.startswith("Helsinki-NLP/opus-mt-")
+
+    @staticmethod
+    def _metadata_note(
+        base_note: str | None,
+        *,
+        checked_at: str | None,
+        metadata_source: str,
+        offline_hint: str,
+    ) -> str | None:
+        parts = [base_note] if base_note else []
+        if checked_at:
+            qualifier = "refreshed" if metadata_source == "refreshed" else "cached"
+            parts.append(f"Metadata {qualifier} at {checked_at}.")
+        elif metadata_source in {"fallback", "heuristic"}:
+            parts.append(offline_hint)
+        return " ".join(part for part in parts if part) or None
+
+    @staticmethod
+    def _coerce_timestamp(value: object) -> str | None:
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()

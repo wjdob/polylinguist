@@ -44,7 +44,9 @@ PACKAGE_MODULES = {
 MARIAN_BATCH_SIZE = 8
 OPENVINO_MARIAN_BATCH_SIZE = 1
 NLLB_BATCH_SIZE = 16
-NLLB_MAX_NEW_TOKENS = 256
+# Subtitle cues are short; keeping the NLLB decode cap tight avoids long stalls
+# when a malformed cue never emits EOS and holds the whole batch open.
+NLLB_MAX_NEW_TOKENS = 64
 
 
 def _configure_huggingface_windows_cache() -> None:

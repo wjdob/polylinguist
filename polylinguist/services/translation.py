@@ -1257,7 +1257,7 @@ def _argos_path_from_model_id(model_id: str) -> tuple[str, str]:
 
 
 def _hf_runtime_packages() -> list[str]:
-    return ["huggingface-hub", "transformers", "torch>=2.7,<2.9", "sentencepiece"]
+    return ["huggingface-hub", "transformers", "torch>=2.7", "sentencepiece"]
 
 
 def _ort_runtime_packages() -> list[str]:

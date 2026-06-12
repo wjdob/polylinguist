@@ -23,7 +23,7 @@ models = [
     "pillow>=10.0.0",
     "sentencepiece>=0.2.0",
     "transformers>=4.51.0",
-    "torch>=2.7,<2.9",
+    "torch>=2.7",
 ]
 windows-gpu = [
     "onnx>=1.17.0",

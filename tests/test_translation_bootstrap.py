@@ -6,6 +6,7 @@ from polylinguist.services.translation import (
     _ensure_python_packages,
     _ensure_openvino_python_compatibility,
     _configure_huggingface_windows_cache,
+    _hf_runtime_packages,
     _load_openvino_seq2seq_class,
     _package_name,
     _package_runtime_ready,
@@ -36,6 +37,11 @@ def test_package_name_strips_specifiers_and_extras():
 def test_gpu_runtime_packages_include_sentencepiece():
     assert "sentencepiece" in _ort_runtime_packages()
     assert any(package.startswith("sentencepiece") for package in _openvino_runtime_packages())
+
+
+def test_hf_runtime_packages_allow_newer_torch():
+    assert "torch>=2.7" in _hf_runtime_packages()
+    assert all(package != "torch>=2.7,<2.9" for package in _hf_runtime_packages())
 
 
 def test_bootstrap_skips_when_modules_exist(monkeypatch):
@@ -71,6 +77,13 @@ def test_package_runtime_ready_detects_incompatible_version(monkeypatch):
     monkeypatch.setattr("polylinguist.services.translation.importlib_metadata.version", lambda package_name: "4.57.6")
 
     assert _package_runtime_ready("transformers>=4.53,<4.54") is False
+
+
+def test_package_runtime_ready_accepts_newer_torch_for_hf_runtime(monkeypatch):
+    monkeypatch.setattr("polylinguist.services.translation._module_available", lambda module_name: True)
+    monkeypatch.setattr("polylinguist.services.translation.importlib_metadata.version", lambda package_name: "2.12.0")
+
+    assert _package_runtime_ready("torch>=2.7") is True
 
 
 def test_openvino_python_compatibility_rejects_windows_python_314(monkeypatch):

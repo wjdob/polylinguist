@@ -136,6 +136,10 @@ The configurator now shows:
 - live model install logs
 - live subtitle translation progress
 
+`Evaluate models` now performs an explicit metadata refresh for model availability.
+Normal model catalog reads stay local/cache-first so the configurator remains usable
+even when Hugging Face or the Argos index are temporarily unavailable.
+
 ## Using it in Stremio
 
 1. Start playback for a movie or episode.
@@ -173,6 +177,15 @@ Behavior in this mode:
   `X-Polylinguist-Admin-Token`
 - the configurator prompts once for the admin token and keeps it in browser
   session storage
+
+### Runtime diagnostics
+
+The admin API now exposes a runtime diagnostics report:
+
+- `GET /api/diagnostics/runtime`
+
+It returns the detected machine profile plus the selected Python runtime,
+package versions, and blocking reasons for each provider/target combination.
 
 ### Caddy reverse proxy helper
 

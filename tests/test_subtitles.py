@@ -1,5 +1,5 @@
 from polylinguist.schemas import AddonSettings
-from polylinguist.services.subtitles import parse_subtitle_text, render_dual_srt
+from polylinguist.services.subtitles import parse_subtitle_text, prepare_translation_batch, render_dual_srt
 
 
 def test_parse_and_render_dual_srt():
@@ -38,3 +38,19 @@ Hello
     )
     assert "Hello" not in rendered
     assert "Bonjour" in rendered
+
+
+def test_prepare_translation_batch_sanitizes_junk_lines():
+    prepared = prepare_translation_batch(
+        [
+            "<i>Hello</i>\n,,,,,,,,,,,,,,,,,,,,,,,,",
+            "[wind whistling outside]",
+            ",,,,,,,,,,,,,,,,,,,,,,,",
+        ]
+    )
+
+    assert prepared.cues[0] == "Hello"
+    assert prepared.active_cues == ["Hello", "[wind whistling outside]"]
+    assert prepared.active_indices == [0, 1]
+    assert prepared.sanitized_count == 2
+    assert prepared.skipped_count == 1

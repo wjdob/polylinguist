@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 from importlib import metadata as importlib_metadata
 import json
@@ -16,6 +17,11 @@ from typing import Callable
 
 from packaging.requirements import Requirement
 
+from polylinguist.services.compatibility import (
+    provider_target_block_reason,
+    runtime_target_block_reason,
+    system_target_block_reason,
+)
 from polylinguist.services.languages import get_language
 from polylinguist.services.local_models import (
     hf_model_cache_exists,
@@ -91,6 +97,7 @@ class PythonRuntime:
     all_modules_present: bool
     current: bool
     has_cuda: bool = False
+    python_version: str | None = None
 
 
 class TranslatorAdapter:
@@ -217,6 +224,10 @@ class ArgosTranslator(TranslatorAdapter):
         progress: ProgressCallback | None = None,
         device_preference: str = "auto",
     ) -> str:
+        target = _normalize_device_preference(device_preference)
+        provider_reason = provider_target_block_reason(self.provider, target)
+        if provider_reason:
+            raise TranslationError(provider_reason)
         runtime = _resolve_runtime(["argostranslate"])
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
@@ -237,6 +248,7 @@ class ArgosTranslator(TranslatorAdapter):
             descriptor.model_id,
             {
                 "python_executable": runtime.executable,
+                "runtime": _runtime_metadata_snapshot(runtime, ["argostranslate"]),
                 "detail": detail,
             },
         )
@@ -289,6 +301,9 @@ class MarianTranslator(TranslatorAdapter):
         device_preference: str = "auto",
     ) -> str:
         target = _normalize_device_preference(device_preference)
+        provider_reason = provider_target_block_reason(self.provider, target)
+        if provider_reason:
+            raise TranslationError(provider_reason)
         if target == "auto":
             target = descriptor.recommended_target or "cpu"
         if target == "directml":
@@ -310,6 +325,7 @@ class MarianTranslator(TranslatorAdapter):
                 descriptor.model_id,
                 {
                     "python_executable": runtime.executable,
+                    "runtime": _runtime_metadata_snapshot(runtime, _ort_runtime_packages()),
                     "detail": detail,
                     "artifact_dir": str(artifact_dir),
                 },
@@ -336,6 +352,7 @@ class MarianTranslator(TranslatorAdapter):
                 descriptor.model_id,
                 {
                     "python_executable": runtime.executable,
+                    "runtime": _runtime_metadata_snapshot(runtime, _openvino_runtime_packages()),
                     "detail": detail,
                     "artifact_dir": str(artifact_dir),
                 },
@@ -360,6 +377,7 @@ class MarianTranslator(TranslatorAdapter):
             descriptor.model_id,
             {
                 "python_executable": runtime.executable,
+                "runtime": _runtime_metadata_snapshot(runtime, _hf_runtime_packages()),
                 "detail": detail,
             },
         )
@@ -593,8 +611,9 @@ class NllbTranslator(TranslatorAdapter):
         device_preference: str = "auto",
     ) -> str:
         target = _normalize_device_preference(device_preference)
-        if target in {"directml", "openvino_gpu"}:
-            raise TranslationError("NLLB is only supported on CPU or CUDA in this release.")
+        provider_reason = provider_target_block_reason(self.provider, target)
+        if provider_reason:
+            raise TranslationError(provider_reason)
         runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=target == "cuda")
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
@@ -612,6 +631,7 @@ class NllbTranslator(TranslatorAdapter):
             descriptor.model_id,
             {
                 "python_executable": runtime.executable,
+                "runtime": _runtime_metadata_snapshot(runtime, _hf_runtime_packages()),
                 "detail": detail,
             },
         )
@@ -624,8 +644,9 @@ class NllbTranslator(TranslatorAdapter):
         progress: ProgressCallback | None = None,
     ) -> list[str]:
         target = _normalize_device_preference(request.device_preference)
-        if target in {"directml", "openvino_gpu"}:
-            raise TranslationError("NLLB is only supported on CPU or CUDA in this release.")
+        provider_reason = provider_target_block_reason(self.provider, target)
+        if provider_reason:
+            raise TranslationError(provider_reason)
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
         if request.device_preference == "cuda" and not _python_runtime_has_cuda(runtime_executable):
@@ -944,16 +965,34 @@ def _resolve_device_preference(device_preference: str, progress: ProgressCallbac
     if normalized == "cpu":
         return "cpu"
     if normalized == "cuda":
-        if not _current_runtime_has_cuda():
-            raise TranslationError("GPU processing was requested, but CUDA is not available in the selected Python runtime.")
+        runtime_reason = runtime_target_block_reason(
+            normalized,
+            has_cuda=_current_runtime_has_cuda(),
+            has_directml=_current_runtime_has_directml(),
+            has_openvino_gpu=_current_runtime_has_openvino_gpu(),
+        )
+        if runtime_reason:
+            raise TranslationError(runtime_reason)
         return "cuda"
     if normalized == "directml":
-        if not _current_runtime_has_directml():
-            raise TranslationError("GPU processing was requested, but DirectML is not available in the selected Python runtime.")
+        runtime_reason = runtime_target_block_reason(
+            normalized,
+            has_cuda=_current_runtime_has_cuda(),
+            has_directml=_current_runtime_has_directml(),
+            has_openvino_gpu=_current_runtime_has_openvino_gpu(),
+        )
+        if runtime_reason:
+            raise TranslationError(runtime_reason)
         return "directml"
     if normalized == "openvino_gpu":
-        if not _current_runtime_has_openvino_gpu():
-            raise TranslationError("GPU processing was requested, but OpenVINO GPU is not available in the selected Python runtime.")
+        runtime_reason = runtime_target_block_reason(
+            normalized,
+            has_cuda=_current_runtime_has_cuda(),
+            has_directml=_current_runtime_has_directml(),
+            has_openvino_gpu=_current_runtime_has_openvino_gpu(),
+        )
+        if runtime_reason:
+            raise TranslationError(runtime_reason)
         return "openvino_gpu"
     if _current_runtime_has_cuda():
         return "cuda"
@@ -1001,6 +1040,7 @@ def _probe_current_runtime(required_modules: tuple[str, ...]) -> PythonRuntime:
         all_modules_present=not missing,
         current=True,
         has_cuda=_current_runtime_has_cuda(),
+        python_version=_current_python_version(),
     )
 
 
@@ -1068,10 +1108,11 @@ def _probe_python_runtime(executable: str, required_modules: tuple[str, ...]) ->
         "    except (ImportError, ModuleNotFoundError, ValueError):\n"
         "        return False\n"
         "mods=sys.argv[1:];"
+        "version='.'.join(str(part) for part in sys.version_info[:3]);"
         "missing=[m for m in mods if not module_available(m)];"
         "torch_spec=importlib.util.find_spec('torch');"
         "has_cuda=bool(__import__('torch').cuda.is_available()) if torch_spec is not None else False;"
-        "print(json.dumps({'missing':missing,'has_cuda':has_cuda}))"
+        "print(json.dumps({'missing':missing,'has_cuda':has_cuda,'python_version':version}))"
     )
     try:
         completed = subprocess.run(
@@ -1091,6 +1132,7 @@ def _probe_python_runtime(executable: str, required_modules: tuple[str, ...]) ->
         all_modules_present=not missing,
         current=False,
         has_cuda=bool(payload.get("has_cuda")),
+        python_version=str(payload.get("python_version") or ""),
     )
 
 
@@ -1263,6 +1305,22 @@ def _argos_path_from_model_id(model_id: str) -> tuple[str, str]:
     return source, target
 
 
+def runtime_packages_for(provider: str, target: str) -> list[str]:
+    normalized_provider = (provider or "").strip().lower()
+    normalized_target = _normalize_device_preference(target)
+    if normalized_provider == "argos":
+        return ["argostranslate"]
+    if normalized_provider == "marian":
+        if normalized_target == "directml":
+            return _ort_runtime_packages()
+        if normalized_target == "openvino_gpu":
+            return _openvino_runtime_packages()
+        return _hf_runtime_packages()
+    if normalized_provider == "nllb":
+        return _hf_runtime_packages()
+    return []
+
+
 def _hf_runtime_packages() -> list[str]:
     return ["huggingface-hub", "transformers", "torch>=2.7", "sentencepiece"]
 
@@ -1311,12 +1369,98 @@ def _package_runtime_ready(package: str) -> bool:
     return installed_version in requirement.specifier
 
 
-def _ensure_openvino_python_compatibility() -> None:
-    if platform.system().lower() == "windows" and sys.version_info >= (3, 14):
-        raise TranslationError(
-            f"OpenVINO GPU on Windows currently requires Python 3.13 or earlier. "
-            f"Detected Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}."
+def _runtime_metadata_snapshot(runtime: PythonRuntime, packages: list[str]) -> dict[str, object]:
+    inspected = _inspect_runtime_environment(runtime.executable, packages)
+    return {
+        "python_executable": runtime.executable,
+        "python_version": inspected.get("python_version") or runtime.python_version,
+        "has_cuda": bool(inspected.get("has_cuda", runtime.has_cuda)),
+        "has_directml": bool(inspected.get("has_directml")),
+        "has_openvino_gpu": bool(inspected.get("has_openvino_gpu")),
+        "requirements": list(packages),
+        "package_versions": inspected.get("packages", {}),
+        "captured_at": _utc_now_iso(),
+    }
+
+
+def _inspect_runtime_environment(executable: str, packages: list[str]) -> dict[str, object]:
+    package_names = list(dict.fromkeys(_package_name(package) for package in packages))
+    if _same_executable(executable, sys.executable):
+        versions = {package_name: _installed_package_version(package_name) for package_name in package_names}
+        return {
+            "python_version": _current_python_version(),
+            "has_cuda": _current_runtime_has_cuda(),
+            "has_directml": _current_runtime_has_directml(),
+            "has_openvino_gpu": _current_runtime_has_openvino_gpu(),
+            "packages": versions,
+        }
+    probe_code = (
+        "import importlib.util,json,sys;"
+        "from importlib import metadata as m;"
+        "def version(name):\n"
+        "    try:\n"
+        "        return m.version(name)\n"
+        "    except m.PackageNotFoundError:\n"
+        "        return None\n"
+        "mods=sys.argv[1:];"
+        "version_str='.'.join(str(part) for part in sys.version_info[:3]);"
+        "torch_spec=importlib.util.find_spec('torch');"
+        "has_cuda=bool(__import__('torch').cuda.is_available()) if torch_spec is not None else False;"
+        "ort_spec=importlib.util.find_spec('onnxruntime');"
+        "has_directml=False;"
+        "if ort_spec is not None:\n"
+        "    try:\n"
+        "        providers={provider.lower() for provider in __import__('onnxruntime').get_available_providers()};\n"
+        "        has_directml='dmlexecutionprovider' in providers or 'directmlexecutionprovider' in providers\n"
+        "    except Exception:\n"
+        "        has_directml=False\n"
+        "ov_spec=importlib.util.find_spec('openvino.runtime');"
+        "has_openvino=False;"
+        "if ov_spec is not None:\n"
+        "    try:\n"
+        "        Core=__import__('openvino.runtime', fromlist=['Core']).Core;\n"
+        "        core=Core();\n"
+        "        has_openvino=any(device.upper().startswith('GPU') for device in core.available_devices)\n"
+        "    except Exception:\n"
+        "        has_openvino=False\n"
+        "packages={name:version(name) for name in mods};"
+        "print(json.dumps({'python_version':version_str,'has_cuda':has_cuda,'has_directml':has_directml,'has_openvino_gpu':has_openvino,'packages':packages}))"
+    )
+    try:
+        completed = subprocess.run(
+            [executable, "-c", probe_code, *package_names],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
+        payload = json.loads(completed.stdout.strip() or "{}")
+    except Exception:
+        payload = {}
+    return {
+        "python_version": payload.get("python_version"),
+        "has_cuda": bool(payload.get("has_cuda")),
+        "has_directml": bool(payload.get("has_directml")),
+        "has_openvino_gpu": bool(payload.get("has_openvino_gpu")),
+        "packages": payload.get("packages", {}),
+    }
+
+
+def _installed_package_version(package_name: str) -> str | None:
+    try:
+        return importlib_metadata.version(package_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _current_python_version() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+
+def _ensure_openvino_python_compatibility() -> None:
+    reason = system_target_block_reason("openvino_gpu")
+    if reason:
+        raise TranslationError(reason)
 
 
 def _load_openvino_seq2seq_class():
@@ -1333,3 +1477,7 @@ def _load_openvino_seq2seq_class():
 def _notify(progress: ProgressCallback | None, stage: str, message: str) -> None:
     if progress is not None:
         progress(stage, message)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()

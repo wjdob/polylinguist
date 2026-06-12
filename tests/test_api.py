@@ -58,6 +58,14 @@ class FakeTranslationManager:
         return None
 
 
+class StaticProfileService:
+    def __init__(self, profile: SystemProfile):
+        self.profile = profile
+
+    def detect(self) -> SystemProfile:
+        return self.profile
+
+
 def build_test_app(tmp_path: Path):
     paths = AppPaths(
         root=tmp_path / ".polylinguist",
@@ -79,7 +87,10 @@ def build_test_app(tmp_path: Path):
     )
     services.subtitle_provider = FakeProvider()
     services.translation_manager = FakeTranslationManager()
-    services.model_catalog.list_models = lambda source_lang, target_lang, profile: ModelCatalogResponse(
+    services.system_profile_service = StaticProfileService(
+        SystemProfile("windows", "amd64", 8, 16.0, 50.0, False, False)
+    )
+    services.model_catalog.list_models = lambda source_lang, target_lang, profile, refresh=False: ModelCatalogResponse(
         source_lang=source_lang,
         target_lang=target_lang,
         recommended_provider="marian",
@@ -131,7 +142,10 @@ def build_uninstalled_test_app(tmp_path: Path):
     services.subtitle_provider = FakeProvider()
     services.translation_manager = FakeTranslationManager()
     services.translation_manager.installed = set()
-    services.model_catalog.list_models = lambda source_lang, target_lang, profile: ModelCatalogResponse(
+    services.system_profile_service = StaticProfileService(
+        SystemProfile("windows", "amd64", 8, 16.0, 50.0, True, False)
+    )
+    services.model_catalog.list_models = lambda source_lang, target_lang, profile, refresh=False: ModelCatalogResponse(
         source_lang=source_lang,
         target_lang=target_lang,
         recommended_provider="marian",
@@ -151,6 +165,61 @@ def build_uninstalled_test_app(tmp_path: Path):
                 installed_targets=[],
                 supported_targets=["cpu", "cuda"],
                 recommended_target="cuda",
+                availability_reason="Fake Marian supports CPU and CUDA.",
+                license="test",
+                recommended=True,
+            )
+        ],
+    )
+    return create_app(services)
+
+
+def build_unsupported_target_app(tmp_path: Path):
+    paths = AppPaths(
+        root=tmp_path / ".polylinguist",
+        cache_dir=tmp_path / ".polylinguist" / "cache",
+        model_artifacts_dir=tmp_path / ".polylinguist" / "models",
+        settings_file=tmp_path / ".polylinguist" / "settings.json",
+        installed_models_file=tmp_path / ".polylinguist" / "installed_models.json",
+        metadata_cache_file=tmp_path / ".polylinguist" / "cache" / "model_metadata.json",
+        generated_subtitles_dir=tmp_path / ".polylinguist" / "cache" / "subtitles",
+    )
+    services = create_services(paths, AppConfig.detect())
+    services.settings_store.save(
+        AddonSettings(
+            source_lang="eng",
+            target_lang="pol",
+            preferred_provider="marian",
+            selected_model_id="Helsinki-NLP/opus-mt-en-ine",
+            processing_device="cuda",
+        )
+    )
+    services.subtitle_provider = FakeProvider()
+    services.translation_manager = FakeTranslationManager()
+    services.translation_manager.installed = set()
+    services.system_profile_service = StaticProfileService(
+        SystemProfile("windows", "amd64", 8, 16.0, 50.0, False, False)
+    )
+    services.model_catalog.list_models = lambda source_lang, target_lang, profile, refresh=False: ModelCatalogResponse(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        recommended_provider="marian",
+        recommended_model_id="Helsinki-NLP/opus-mt-en-ine",
+        profile=profile.to_response(),
+        models=[
+            ModelOptionResponse(
+                provider="marian",
+                model_id="Helsinki-NLP/opus-mt-en-ine",
+                label="Fake Marian Fallback",
+                source_lang=source_lang,
+                target_lang=target_lang,
+                size_mb=320,
+                available=True,
+                direct=False,
+                installed=False,
+                installed_targets=[],
+                supported_targets=["cpu", "cuda"],
+                recommended_target="cpu",
                 availability_reason="Fake Marian supports CPU and CUDA.",
                 license="test",
                 recommended=True,
@@ -187,7 +256,19 @@ def build_remote_admin_app(tmp_path: Path):
     )
     services.subtitle_provider = FakeProvider()
     services.translation_manager = FakeTranslationManager()
-    services.model_catalog.list_models = lambda source_lang, target_lang, profile: ModelCatalogResponse(
+    services.system_profile_service = StaticProfileService(
+        SystemProfile(
+            "windows",
+            "amd64",
+            8,
+            16.0,
+            50.0,
+            False,
+            False,
+            accelerators=(AcceleratorInfo(vendor="intel", name="Arc A750", supported_targets=("openvino_gpu",)),),
+        )
+    )
+    services.model_catalog.list_models = lambda source_lang, target_lang, profile, refresh=False: ModelCatalogResponse(
         source_lang=source_lang,
         target_lang=target_lang,
         recommended_provider="marian",
@@ -363,6 +444,18 @@ def test_settings_round_trip_includes_processing_device(tmp_path: Path):
     assert response.json()["settings"]["processing_device"] == "cpu"
 
 
+def test_runtime_diagnostics_reports_runtimes(tmp_path: Path):
+    app = build_test_app(tmp_path)
+    client = TestClient(app)
+
+    response = client.get("/api/diagnostics/runtime")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["profile"]["os"] == "windows"
+    assert any(item["provider"] == "marian" and item["target"] == "cpu" for item in payload["runtimes"])
+
+
 def test_subtitle_generation_activity(tmp_path: Path):
     app = build_test_app(tmp_path)
     client = TestClient(app)
@@ -401,6 +494,24 @@ def test_uninstalled_model_returns_setup_placeholder(tmp_path: Path):
     assert generated.status_code == 200
     assert "Polylinguist setup required." in generated.text
     assert "00:00:00,000 --> 99:59:59,000" in generated.text
+
+
+def test_unsupported_target_returns_configuration_placeholder(tmp_path: Path):
+    app = build_unsupported_target_app(tmp_path)
+    client = TestClient(app)
+
+    manifest = client.get("/manifest.json")
+    config_token = manifest.json()["links"]["manifest"].split("/")[-2]
+    subtitles = client.get(f"/{config_token}/subtitles/movie/tt1234567.json")
+
+    assert subtitles.status_code == 200
+    payload = subtitles.json()
+    assert len(payload["subtitles"]) == 1
+    assert "configuration issue" in payload["subtitles"][0]["label"].lower()
+
+    generated = client.get(payload["subtitles"][0]["url"].replace("http://testserver", ""))
+    assert generated.status_code == 200
+    assert "Polylinguist configuration needs attention." in generated.text
 
 
 def test_manifest_has_cors_headers(tmp_path: Path):

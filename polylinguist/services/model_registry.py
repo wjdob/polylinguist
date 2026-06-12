@@ -81,6 +81,13 @@ class InstalledModelRegistry:
     def entries(self) -> dict[str, dict[str, object]]:
         return self.load()
 
+    def active_entries(self) -> dict[str, dict[str, object]]:
+        return {
+            key: metadata
+            for key, metadata in self.load().items()
+            if self._is_active_entry(metadata)
+        }
+
     def clear(self) -> None:
         if self.storage_file.exists():
             self.storage_file.unlink()

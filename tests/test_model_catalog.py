@@ -13,7 +13,7 @@ def make_catalog(tmp_path: Path) -> ModelCatalogService:
 def test_argos_direct_pair(monkeypatch, tmp_path: Path):
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {("en", "es"): 80})
-    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: False)
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (False, None, "cached"))
     profile = SystemProfile("windows", "amd64", 8, 16.0, 50.0, False, False)
     response = catalog.list_models("eng", "spa", profile)
     argos = next(model for model in response.models if model.provider == "argos")
@@ -24,7 +24,7 @@ def test_argos_direct_pair(monkeypatch, tmp_path: Path):
 def test_argos_pivot_pair(monkeypatch, tmp_path: Path):
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {("fr", "en"): 60, ("en", "tr"): 100})
-    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: False)
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (False, None, "cached"))
     profile = SystemProfile("windows", "amd64", 4, 8.0, 20.0, False, False)
     response = catalog.list_models("fre", "tur", profile)
     argos = next(model for model in response.models if model.provider == "argos")
@@ -36,7 +36,7 @@ def test_argos_pivot_pair(monkeypatch, tmp_path: Path):
 def test_marian_and_nllb_availability(monkeypatch, tmp_path: Path):
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {})
-    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: True)
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (True, None, "cached"))
     profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, False, False)
     response = catalog.list_models("eng", "spa", profile)
     marian = next(model for model in response.models if model.provider == "marian")
@@ -53,7 +53,7 @@ def test_marian_english_polish_falls_back_to_en_ine(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(
         catalog,
         "_probe_huggingface_model",
-        lambda model_id: model_id == "Helsinki-NLP/opus-mt-en-ine",
+        lambda model_id, refresh=False: (model_id == "Helsinki-NLP/opus-mt-en-ine", None, "cached"),
     )
     profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, True, False)
     response = catalog.list_models("eng", "pol", profile)
@@ -70,7 +70,7 @@ def test_marian_english_turkish_falls_back_to_en_trk(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         catalog,
         "_probe_huggingface_model",
-        lambda model_id: model_id == "Helsinki-NLP/opus-mt-en-trk",
+        lambda model_id, refresh=False: (model_id == "Helsinki-NLP/opus-mt-en-trk", None, "cached"),
     )
     profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, True, False)
     response = catalog.list_models("eng", "tur", profile)
@@ -83,7 +83,7 @@ def test_marian_english_turkish_falls_back_to_en_trk(monkeypatch, tmp_path: Path
 def test_low_machine_prefers_argos(monkeypatch, tmp_path: Path):
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {("en", "es"): 80})
-    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: True)
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (True, None, "cached"))
     profile = SystemProfile("windows", "amd64", 2, 4.0, 10.0, False, False)
     response = catalog.list_models("eng", "spa", profile)
     assert response.recommended_provider == "argos"
@@ -92,7 +92,7 @@ def test_low_machine_prefers_argos(monkeypatch, tmp_path: Path):
 def test_marian_exposes_directml_and_openvino_targets(monkeypatch, tmp_path: Path):
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {})
-    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id: True)
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (True, None, "cached"))
     profile = SystemProfile(
         "windows",
         "amd64",
@@ -120,7 +120,7 @@ def test_removed_marian_cpu_target_hides_shared_hf_cache(monkeypatch, tmp_path: 
     monkeypatch.setattr(
         catalog,
         "_probe_huggingface_model",
-        lambda model_id: model_id == "Helsinki-NLP/opus-mt-en-ine",
+        lambda model_id, refresh=False: (model_id == "Helsinki-NLP/opus-mt-en-ine", None, "cached"),
     )
     monkeypatch.setattr("polylinguist.services.model_catalog.hf_model_cache_exists", lambda model_id: True)
     profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, True, False)
@@ -131,3 +131,38 @@ def test_removed_marian_cpu_target_hides_shared_hf_cache(monkeypatch, tmp_path: 
     assert marian.installed is False
     assert "cpu" not in marian.installed_targets
     assert "cuda" not in marian.installed_targets
+
+
+def test_list_models_is_offline_safe_without_refresh(monkeypatch, tmp_path: Path):
+    catalog = make_catalog(tmp_path)
+    called = []
+
+    def fail_if_called(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("network should not be used for offline-safe model reads")
+
+    monkeypatch.setattr("polylinguist.services.model_catalog.httpx.get", fail_if_called)
+    profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, False, False)
+
+    response = catalog.list_models("eng", "spa", profile)
+
+    assert response.models
+    assert called == []
+    marian = next(model for model in response.models if model.provider == "marian")
+    assert marian.available is True
+    assert "offline heuristic" in (marian.note or "").lower()
+
+
+def test_refresh_huggingface_probe_persists_timestamp(monkeypatch, tmp_path: Path):
+    catalog = make_catalog(tmp_path)
+
+    class Response:
+        status_code = 200
+
+    monkeypatch.setattr("polylinguist.services.model_catalog.httpx.get", lambda *args, **kwargs: Response())
+
+    exists, checked_at, source = catalog._probe_huggingface_model("Helsinki-NLP/opus-mt-en-ine", refresh=True)
+
+    assert exists is True
+    assert checked_at is not None
+    assert source == "refreshed"

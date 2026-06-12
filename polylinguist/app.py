@@ -78,6 +78,12 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         services = get_services(request)
         return services.system_profile_service.detect().to_response().model_dump()
 
+    @app.get("/api/diagnostics/runtime")
+    async def get_runtime_diagnostics(request: Request) -> dict[str, Any]:
+        require_admin_access(request)
+        services = get_services(request)
+        return services.runtime_diagnostics()
+
     @app.get("/api/settings", response_model=SettingsEnvelope)
     async def get_settings(request: Request) -> SettingsEnvelope:
         require_admin_access(request)
@@ -105,6 +111,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
         request: Request,
         source_lang: str = Query(...),
         target_lang: str = Query(...),
+        refresh: bool = Query(False),
     ) -> ModelCatalogResponse:
         require_admin_access(request)
         services = get_services(request)
@@ -112,6 +119,7 @@ def create_app(services: AppServices | None = None) -> FastAPI:
             source_lang,
             target_lang,
             services.system_profile_service.detect(),
+            refresh=refresh,
         )
 
     @app.post("/api/models/install", response_model=InstallJobResponse)
@@ -1248,7 +1256,7 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       renderManifest(settings);
       document.getElementById("model-status").textContent = "Checking local recommendation and model availability...";
       try {{
-        const payload = await loadJson("/api/models?source_lang=" + settings.source_lang + "&target_lang=" + settings.target_lang);
+        const payload = await loadJson("/api/models?source_lang=" + settings.source_lang + "&target_lang=" + settings.target_lang + "&refresh=true");
         renderModels(payload);
         currentSettings = readSettings();
         renderManifest(currentSettings);

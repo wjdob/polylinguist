@@ -31,14 +31,14 @@ from polylinguist.services.subtitles import (
 )
 from polylinguist.services.subtitle_jobs import SubtitleGenerationTracker
 from polylinguist.services.system_profile import SystemProfileService
-from polylinguist.services.translation import (
-    TranslationManager,
-    TranslationRequest,
-    _inspect_runtime_environment,
-    _resolve_runtime,
-    _runtime_metadata_snapshot,
+from polylinguist.services.runtime_support import (
+    compatible_runtime_block_reason,
+    inspect_runtime_environment,
+    resolve_runtime_for_target,
+    runtime_metadata_snapshot,
     runtime_packages_for,
 )
+from polylinguist.services.translation import TranslationManager, TranslationRequest
 from polylinguist.services.local_models import local_model_artifact_dir
 
 
@@ -333,9 +333,16 @@ class AppServices:
                 provider_reason = provider_target_block_reason(provider, target)
                 system_reason = system_target_block_reason(target, system_name=profile.os)
                 machine_reason = machine_target_block_reason(profile, target)
-                blocking_reasons = [reason for reason in (provider_reason, system_reason, machine_reason) if reason]
                 stored = self._stored_runtime_entry(entries, provider, target)
-                snapshot = self._resolve_runtime_snapshot(provider, target, stored, requirements, blocking_reasons)
+                runtime_reason = (
+                    compatible_runtime_block_reason(target, system_name=profile.os)
+                    if stored is None and not provider_reason and not system_reason and not machine_reason
+                    else None
+                )
+                blocking_reasons = [
+                    reason for reason in (provider_reason, system_reason, machine_reason, runtime_reason) if reason
+                ]
+                snapshot = self._resolve_runtime_snapshot(provider, target, profile.os, stored, requirements, blocking_reasons)
                 package_rows = self._runtime_package_rows(requirements, snapshot)
                 if snapshot:
                     for row in package_rows:
@@ -436,6 +443,7 @@ class AppServices:
     def _resolve_runtime_snapshot(
         provider: str,
         target: str,
+        system_name: str,
         stored: tuple[str, dict[str, object]] | None,
         requirements: list[str],
         blocking_reasons: list[str],
@@ -447,11 +455,11 @@ class AppServices:
                 return runtime
             executable = str(metadata.get("python_executable") or "").strip()
             if executable:
-                return _inspect_runtime_environment(executable, requirements) | {"python_executable": executable}
+                return inspect_runtime_environment(executable, requirements) | {"python_executable": executable}
         if blocking_reasons:
             return None
-        runtime = _resolve_runtime(requirements, prefer_cuda=target == "cuda")
-        return _runtime_metadata_snapshot(runtime, requirements)
+        runtime = resolve_runtime_for_target(target, requirements, prefer_cuda=target == "cuda", system_name=system_name)
+        return runtime_metadata_snapshot(runtime, requirements)
 
     @staticmethod
     def _runtime_package_rows(requirements: list[str], snapshot: dict[str, object] | None) -> list[dict[str, object]]:

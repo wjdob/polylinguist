@@ -17,6 +17,7 @@ from polylinguist.services.compatibility import (
 from polylinguist.services.languages import get_language, normalize_language
 from polylinguist.services.local_models import hf_model_cache_exists, local_model_artifact_exists
 from polylinguist.services.model_registry import InstalledModelRegistry
+from polylinguist.services.runtime_support import compatible_runtime_block_reason
 from polylinguist.services.system_profile import SystemProfile
 
 
@@ -179,6 +180,9 @@ class ModelCatalogService:
         machine_reason = machine_target_block_reason(profile, normalized)
         if machine_reason:
             return False, machine_reason
+        runtime_reason = self._runtime_target_block_reason(profile, provider, normalized)
+        if runtime_reason:
+            return False, runtime_reason
         if normalized not in model.supported_targets:
             supported = ", ".join(model.supported_targets) or "none"
             return False, f"{model.label} does not support {target_label(normalized)}. Supported targets: {supported}."
@@ -458,11 +462,11 @@ class ModelCatalogService:
 
     def _marian_supported_targets(self, profile: SystemProfile) -> tuple[str, ...]:
         targets = ["cpu"]
-        if machine_target_block_reason(profile, "cuda") is None:
+        if self._target_supported(profile, "marian", "cuda"):
             targets.append("cuda")
-        if machine_target_block_reason(profile, "openvino_gpu") is None:
+        if self._target_supported(profile, "marian", "openvino_gpu"):
             targets.append("openvino_gpu")
-        if machine_target_block_reason(profile, "directml") is None:
+        if self._target_supported(profile, "marian", "directml"):
             targets.append("directml")
         return tuple(targets)
 
@@ -472,7 +476,7 @@ class ModelCatalogService:
         if not source or not target or not source.nllb_code or not target.nllb_code:
             return []
         targets = ["cpu"]
-        if machine_target_block_reason(profile, "cuda") is None:
+        if self._target_supported(profile, "nllb", "cuda"):
             targets.append("cuda")
         return targets
 
@@ -482,6 +486,26 @@ class ModelCatalogService:
             if target in supported_targets and (target == "cpu" or profile.supports_target(target)):
                 return target
         return "cpu"
+
+    def _target_supported(self, profile: SystemProfile, provider: str, target: str) -> bool:
+        return self._target_block_reason(profile, provider, target) is None
+
+    def _runtime_target_block_reason(self, profile: SystemProfile, provider: str, target: str) -> str | None:
+        if provider_target_block_reason(provider, target):
+            return None
+        return compatible_runtime_block_reason(target, system_name=profile.os)
+
+    def _target_block_reason(self, profile: SystemProfile, provider: str, target: str) -> str | None:
+        provider_reason = provider_target_block_reason(provider, target)
+        if provider_reason:
+            return provider_reason
+        system_reason = system_target_block_reason(target, system_name=profile.os)
+        if system_reason:
+            return system_reason
+        machine_reason = machine_target_block_reason(profile, target)
+        if machine_reason:
+            return machine_reason
+        return self._runtime_target_block_reason(profile, provider, target)
 
     def _installed_targets_for_marian(self, model_id: str) -> tuple[str, ...]:
         installed = set(self.registry.installed_targets("marian", model_id))

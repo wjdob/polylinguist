@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from polylinguist.schemas import AcceleratorResponse, SystemProfileResponse
-from polylinguist.services.compatibility import system_target_block_reason
+from polylinguist.services.compatibility import python_target_block_reason
 
 
 @dataclass(frozen=True)
@@ -287,8 +287,6 @@ def _supports_directml_adapter(adapter: _VideoAdapter) -> bool:
 def _supports_openvino_gpu_adapter(adapter: _VideoAdapter) -> bool:
     if adapter.vendor != "intel":
         return False
-    if system_target_block_reason("openvino_gpu") is not None:
-        return False
     lowered = adapter.name.lower()
     unsupported_markers = ("basic display", "remote display", "virtual", "hyper-v")
     if any(marker in lowered for marker in unsupported_markers):
@@ -298,7 +296,11 @@ def _supports_openvino_gpu_adapter(adapter: _VideoAdapter) -> bool:
 
 
 def _python_supports_openvino_gpu() -> bool:
-    return system_target_block_reason("openvino_gpu") is None
+    return python_target_block_reason(
+        "openvino_gpu",
+        system_name=platform.system(),
+        python_version=sys.version_info,
+    ) is None
 
 
 def _directml_runtime_ready() -> bool:

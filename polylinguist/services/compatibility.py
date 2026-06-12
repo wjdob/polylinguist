@@ -42,6 +42,18 @@ def system_target_block_reason(
     target: str | None,
     *,
     system_name: str | None = None,
+) -> str | None:
+    normalized_target = normalize_target(target)
+    system_name = (system_name or platform.system()).lower()
+    _ = normalized_target
+    _ = system_name
+    return None
+
+
+def python_target_block_reason(
+    target: str | None,
+    *,
+    system_name: str | None = None,
     python_version: object | None = None,
 ) -> str | None:
     normalized_target = normalize_target(target)
@@ -64,13 +76,6 @@ def machine_target_block_reason(profile: "SystemProfile", target: str | None) ->
     if normalized_target == "directml" and not _profile_has_target(profile, "directml"):
         return "The current machine does not expose DirectML."
     if normalized_target == "openvino_gpu":
-        system_reason = system_target_block_reason(
-            normalized_target,
-            system_name=profile.os,
-            python_version=sys.version_info,
-        )
-        if system_reason:
-            return system_reason
         if not _profile_has_target(profile, "openvino_gpu"):
             return "The current machine does not expose OpenVINO GPU."
     return None
@@ -89,10 +94,16 @@ def runtime_target_block_reason(
     system_reason = system_target_block_reason(
         normalized_target,
         system_name=system_name,
-        python_version=python_version,
     )
     if system_reason:
         return system_reason
+    python_reason = python_target_block_reason(
+        normalized_target,
+        system_name=system_name,
+        python_version=python_version,
+    )
+    if python_reason:
+        return python_reason
     if normalized_target == "cuda" and not has_cuda:
         return "GPU processing was requested, but CUDA is not available in the selected Python runtime."
     if normalized_target == "directml" and not has_directml:

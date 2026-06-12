@@ -136,7 +136,7 @@ def build_uninstalled_test_app(tmp_path: Path):
             target_lang="pol",
             preferred_provider="marian",
             selected_model_id="Helsinki-NLP/opus-mt-en-ine",
-            processing_device="cuda",
+            processing_device="cpu",
         )
     )
     services.subtitle_provider = FakeProvider()
@@ -163,9 +163,9 @@ def build_uninstalled_test_app(tmp_path: Path):
                 direct=False,
                 installed=False,
                 installed_targets=[],
-                supported_targets=["cpu", "cuda"],
-                recommended_target="cuda",
-                availability_reason="Fake Marian supports CPU and CUDA.",
+                supported_targets=["cpu"],
+                recommended_target="cpu",
+                availability_reason="Fake Marian supports CPU.",
                 license="test",
                 recommended=True,
             )
@@ -332,6 +332,17 @@ def test_manifest_and_subtitle_flow(tmp_path: Path):
     assert "Hello world" in generated.text
 
 
+def test_configure_page_exposes_explicit_online_refresh(tmp_path: Path):
+    app = build_test_app(tmp_path)
+    client = TestClient(app)
+
+    response = client.get("/configure")
+
+    assert response.status_code == 200
+    assert "Refresh availability" in response.text
+    assert 'document.getElementById("refresh-models-online")' in response.text
+
+
 def test_subtitle_flow_accepts_stremio_extra_path(tmp_path: Path):
     app = build_test_app(tmp_path)
     client = TestClient(app)
@@ -454,6 +465,51 @@ def test_runtime_diagnostics_reports_runtimes(tmp_path: Path):
     payload = response.json()
     assert payload["profile"]["os"] == "windows"
     assert any(item["provider"] == "marian" and item["target"] == "cpu" for item in payload["runtimes"])
+
+
+def test_runtime_diagnostics_prefers_compatible_openvino_worker(tmp_path: Path, monkeypatch):
+    app = build_remote_admin_app(tmp_path)
+    client = TestClient(app)
+
+    fake_runtime = type(
+        "Runtime",
+        (),
+        {
+            "executable": r"C:\\Python313\\python.exe",
+            "current": False,
+            "has_cuda": False,
+            "has_directml": False,
+            "has_openvino_gpu": False,
+            "python_version": "3.13.9",
+        },
+    )()
+
+    monkeypatch.setattr("polylinguist.services.runtime.compatible_runtime_block_reason", lambda target, system_name=None: None)
+    monkeypatch.setattr(
+        "polylinguist.services.runtime.resolve_runtime_for_target",
+        lambda target, requirements, prefer_cuda=False, system_name=None: fake_runtime,
+    )
+    monkeypatch.setattr(
+        "polylinguist.services.runtime.runtime_metadata_snapshot",
+        lambda runtime, requirements: {
+            "python_executable": runtime.executable,
+            "python_version": runtime.python_version,
+            "has_cuda": runtime.has_cuda,
+            "has_directml": runtime.has_directml,
+            "has_openvino_gpu": runtime.has_openvino_gpu,
+            "package_versions": {},
+        },
+    )
+
+    response = client.get(
+        "/api/diagnostics/runtime",
+        headers={"X-Polylinguist-Admin-Token": "secret-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    openvino_row = next(item for item in payload["runtimes"] if item["provider"] == "marian" and item["target"] == "openvino_gpu")
+    assert openvino_row["selected_python"] == r"C:\\Python313\\python.exe"
 
 
 def test_subtitle_generation_activity(tmp_path: Path):

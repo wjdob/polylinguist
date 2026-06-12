@@ -122,10 +122,12 @@ uvicorn polylinguist.app:create_app --factory --host 127.0.0.1 --port 8000 --rel
    - target translation language
    - subtitle mode
    - processing target: `auto`, `cpu`, `cuda`, `directml`, or `openvino_gpu`
-3. Click `Evaluate models`.
-4. Install the model backend you want to use.
-5. Click `Copy manifest URL`.
-6. Add that manifest URL to Stremio as an addon.
+3. Click `Evaluate models` for a cache-first/local view of model support.
+4. Click `Refresh availability` when you want Polylinguist to refresh online
+   Hugging Face and Argos metadata.
+5. Install the model backend you want to use.
+6. Click `Copy manifest URL`.
+7. Add that manifest URL to Stremio as an addon.
 
 The configurator now shows:
 
@@ -136,9 +138,9 @@ The configurator now shows:
 - live model install logs
 - live subtitle translation progress
 
-`Evaluate models` now performs an explicit metadata refresh for model availability.
-Normal model catalog reads stay local/cache-first so the configurator remains usable
+`Evaluate models` now stays local/cache-first so the configurator remains usable
 even when Hugging Face or the Argos index are temporarily unavailable.
+Use `Refresh availability` when you want an explicit online metadata refresh.
 
 ## Using it in Stremio
 
@@ -186,6 +188,9 @@ The admin API now exposes a runtime diagnostics report:
 
 It returns the detected machine profile plus the selected Python runtime,
 package versions, and blocking reasons for each provider/target combination.
+On Windows, this report now reflects worker-runtime selection too, so a
+Python 3.14 service can still point Marian OpenVINO at a discovered Python 3.13
+worker runtime when one is available.
 
 ### Caddy reverse proxy helper
 
@@ -250,6 +255,9 @@ or Intel Arc hardware.
 
 The benchmark runner lives in
 [`scripts/benchmark_translation.py`](scripts/benchmark_translation.py).
+It now uses the same subtitle sanitation step as the live translation pipeline
+and prefers installed Marian DirectML/OpenVINO artifacts when they already
+exist under Polylinguist's local model directory.
 
 Example commands:
 

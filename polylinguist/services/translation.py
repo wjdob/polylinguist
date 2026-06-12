@@ -18,9 +18,9 @@ from typing import Callable
 from packaging.requirements import Requirement
 
 from polylinguist.services.compatibility import (
+    python_target_block_reason,
     provider_target_block_reason,
     runtime_target_block_reason,
-    system_target_block_reason,
 )
 from polylinguist.services.languages import get_language
 from polylinguist.services.local_models import (
@@ -30,6 +30,11 @@ from polylinguist.services.local_models import (
 )
 from polylinguist.services.model_catalog import ModelDescriptor
 from polylinguist.services.model_registry import InstalledModelRegistry
+from polylinguist.services.runtime_support import (
+    inspect_runtime_environment as _shared_inspect_runtime_environment,
+    probe_python_runtime as _shared_probe_python_runtime,
+    resolve_runtime_for_target,
+)
 
 
 PACKAGE_MODULES = {
@@ -307,7 +312,7 @@ class MarianTranslator(TranslatorAdapter):
         if target == "auto":
             target = descriptor.recommended_target or "cpu"
         if target == "directml":
-            runtime = _resolve_runtime(_ort_runtime_packages())
+            runtime = resolve_runtime_for_target(target, _ort_runtime_packages())
             artifact_dir = self._artifact_dir(descriptor.model_id, "directml")
             _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
             if runtime.current:
@@ -334,7 +339,7 @@ class MarianTranslator(TranslatorAdapter):
             return detail
 
         if target == "openvino_gpu":
-            runtime = _resolve_runtime(_openvino_runtime_packages())
+            runtime = resolve_runtime_for_target(target, _openvino_runtime_packages())
             artifact_dir = self._artifact_dir(descriptor.model_id, "openvino_gpu")
             _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
             if runtime.current:
@@ -360,7 +365,7 @@ class MarianTranslator(TranslatorAdapter):
             )
             return detail
 
-        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=target == "cuda")
+        runtime = resolve_runtime_for_target(target, _hf_runtime_packages(), prefer_cuda=target == "cuda")
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
             _ensure_python_packages(_hf_runtime_packages(), "MarianMT", progress)
@@ -405,7 +410,7 @@ class MarianTranslator(TranslatorAdapter):
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
         if request.device_preference == "cuda" and not _python_runtime_has_cuda(runtime_executable):
-            preferred_runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=True)
+            preferred_runtime = resolve_runtime_for_target("cuda", _hf_runtime_packages(), prefer_cuda=True)
             if preferred_runtime.has_cuda:
                 runtime_executable = preferred_runtime.executable
         if _same_executable(runtime_executable, sys.executable):
@@ -614,7 +619,7 @@ class NllbTranslator(TranslatorAdapter):
         provider_reason = provider_target_block_reason(self.provider, target)
         if provider_reason:
             raise TranslationError(provider_reason)
-        runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=target == "cuda")
+        runtime = resolve_runtime_for_target(target, _hf_runtime_packages(), prefer_cuda=target == "cuda")
         _notify(progress, "runtime", f"Using Python runtime: {runtime.executable}")
         if runtime.current:
             _ensure_python_packages(_hf_runtime_packages(), "NLLB", progress)
@@ -650,7 +655,7 @@ class NllbTranslator(TranslatorAdapter):
         metadata = self.registry.metadata_for(self.provider, request.model_id) or {}
         runtime_executable = metadata.get("python_executable", sys.executable)
         if request.device_preference == "cuda" and not _python_runtime_has_cuda(runtime_executable):
-            preferred_runtime = _resolve_runtime(_hf_runtime_packages(), prefer_cuda=True)
+            preferred_runtime = resolve_runtime_for_target("cuda", _hf_runtime_packages(), prefer_cuda=True)
             if preferred_runtime.has_cuda:
                 runtime_executable = preferred_runtime.executable
         if _same_executable(runtime_executable, sys.executable):
@@ -1098,42 +1103,7 @@ def _discover_with_command(command: list[str]) -> list[str]:
 
 
 def _probe_python_runtime(executable: str, required_modules: tuple[str, ...]) -> PythonRuntime | None:
-    if _same_executable(executable, sys.executable):
-        return _probe_current_runtime(required_modules)
-    probe_code = (
-        "import importlib.util,json,sys;"
-        "def module_available(name):\n"
-        "    try:\n"
-        "        return importlib.util.find_spec(name) is not None\n"
-        "    except (ImportError, ModuleNotFoundError, ValueError):\n"
-        "        return False\n"
-        "mods=sys.argv[1:];"
-        "version='.'.join(str(part) for part in sys.version_info[:3]);"
-        "missing=[m for m in mods if not module_available(m)];"
-        "torch_spec=importlib.util.find_spec('torch');"
-        "has_cuda=bool(__import__('torch').cuda.is_available()) if torch_spec is not None else False;"
-        "print(json.dumps({'missing':missing,'has_cuda':has_cuda,'python_version':version}))"
-    )
-    try:
-        completed = subprocess.run(
-            [executable, "-c", probe_code, *required_modules],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        payload = json.loads(completed.stdout.strip() or "{}")
-    except Exception:
-        return None
-    missing = tuple(payload.get("missing", []))
-    return PythonRuntime(
-        executable=executable,
-        missing_modules=missing,
-        all_modules_present=not missing,
-        current=False,
-        has_cuda=bool(payload.get("has_cuda")),
-        python_version=str(payload.get("python_version") or ""),
-    )
+    return _shared_probe_python_runtime(executable, required_modules)
 
 
 def _ensure_python_packages(packages: list[str], feature_name: str, progress: ProgressCallback | None = None) -> None:
@@ -1384,66 +1354,7 @@ def _runtime_metadata_snapshot(runtime: PythonRuntime, packages: list[str]) -> d
 
 
 def _inspect_runtime_environment(executable: str, packages: list[str]) -> dict[str, object]:
-    package_names = list(dict.fromkeys(_package_name(package) for package in packages))
-    if _same_executable(executable, sys.executable):
-        versions = {package_name: _installed_package_version(package_name) for package_name in package_names}
-        return {
-            "python_version": _current_python_version(),
-            "has_cuda": _current_runtime_has_cuda(),
-            "has_directml": _current_runtime_has_directml(),
-            "has_openvino_gpu": _current_runtime_has_openvino_gpu(),
-            "packages": versions,
-        }
-    probe_code = (
-        "import importlib.util,json,sys;"
-        "from importlib import metadata as m;"
-        "def version(name):\n"
-        "    try:\n"
-        "        return m.version(name)\n"
-        "    except m.PackageNotFoundError:\n"
-        "        return None\n"
-        "mods=sys.argv[1:];"
-        "version_str='.'.join(str(part) for part in sys.version_info[:3]);"
-        "torch_spec=importlib.util.find_spec('torch');"
-        "has_cuda=bool(__import__('torch').cuda.is_available()) if torch_spec is not None else False;"
-        "ort_spec=importlib.util.find_spec('onnxruntime');"
-        "has_directml=False;"
-        "if ort_spec is not None:\n"
-        "    try:\n"
-        "        providers={provider.lower() for provider in __import__('onnxruntime').get_available_providers()};\n"
-        "        has_directml='dmlexecutionprovider' in providers or 'directmlexecutionprovider' in providers\n"
-        "    except Exception:\n"
-        "        has_directml=False\n"
-        "ov_spec=importlib.util.find_spec('openvino.runtime');"
-        "has_openvino=False;"
-        "if ov_spec is not None:\n"
-        "    try:\n"
-        "        Core=__import__('openvino.runtime', fromlist=['Core']).Core;\n"
-        "        core=Core();\n"
-        "        has_openvino=any(device.upper().startswith('GPU') for device in core.available_devices)\n"
-        "    except Exception:\n"
-        "        has_openvino=False\n"
-        "packages={name:version(name) for name in mods};"
-        "print(json.dumps({'python_version':version_str,'has_cuda':has_cuda,'has_directml':has_directml,'has_openvino_gpu':has_openvino,'packages':packages}))"
-    )
-    try:
-        completed = subprocess.run(
-            [executable, "-c", probe_code, *package_names],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        payload = json.loads(completed.stdout.strip() or "{}")
-    except Exception:
-        payload = {}
-    return {
-        "python_version": payload.get("python_version"),
-        "has_cuda": bool(payload.get("has_cuda")),
-        "has_directml": bool(payload.get("has_directml")),
-        "has_openvino_gpu": bool(payload.get("has_openvino_gpu")),
-        "packages": payload.get("packages", {}),
-    }
+    return _shared_inspect_runtime_environment(executable, packages)
 
 
 def _installed_package_version(package_name: str) -> str | None:
@@ -1458,7 +1369,11 @@ def _current_python_version() -> str:
 
 
 def _ensure_openvino_python_compatibility() -> None:
-    reason = system_target_block_reason("openvino_gpu")
+    reason = python_target_block_reason(
+        "openvino_gpu",
+        system_name=platform.system(),
+        python_version=sys.version_info,
+    )
     if reason:
         raise TranslationError(reason)
 

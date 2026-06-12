@@ -1,7 +1,11 @@
 import os
 import sys
+from pathlib import Path
 
+from polylinguist.services.model_catalog import ModelDescriptor
+from polylinguist.services.model_registry import InstalledModelRegistry
 from polylinguist.services.translation import (
+    MarianTranslator,
     _discover_python_executables,
     _ensure_python_packages,
     _ensure_openvino_python_compatibility,
@@ -175,6 +179,59 @@ def test_huggingface_windows_cache_sets_no_symlink_mode(monkeypatch):
     _configure_huggingface_windows_cache()
 
     assert os.environ["HF_HUB_DISABLE_SYMLINKS"] == "1"
+
+
+def test_openvino_install_uses_compatible_worker_runtime(monkeypatch, tmp_path: Path):
+    registry = InstalledModelRegistry(tmp_path / "installed.json")
+    translator = MarianTranslator(registry, tmp_path / "models")
+
+    fake_runtime = type(
+        "Runtime",
+        (),
+        {
+            "executable": r"C:\\Python313\\python.exe",
+            "current": False,
+            "has_cuda": False,
+        },
+    )()
+
+    monkeypatch.setattr(
+        "polylinguist.services.translation.resolve_runtime_for_target",
+        lambda target, packages, prefer_cuda=False, system_name=None: fake_runtime,
+    )
+    monkeypatch.setattr(
+        "polylinguist.services.translation._run_worker",
+        lambda executable, command, payload, progress=None: (
+            executable == r"C:\\Python313\\python.exe" and command == "install-marian-openvino" and "installed"
+        ),
+    )
+    monkeypatch.setattr(
+        "polylinguist.services.translation._runtime_metadata_snapshot",
+        lambda runtime, packages: {"python_executable": runtime.executable, "python_version": "3.13.9"},
+    )
+
+    detail = translator.install(
+        ModelDescriptor(
+            provider="marian",
+            model_id="Helsinki-NLP/opus-mt-en-ine",
+            label="Fake Marian",
+            source_lang="eng",
+            target_lang="pol",
+            size_mb=320,
+            available=True,
+            direct=False,
+            installed=False,
+            installed_targets=(),
+            supported_targets=("cpu", "openvino_gpu"),
+            recommended_target="openvino_gpu",
+        ),
+        device_preference="openvino_gpu",
+    )
+
+    assert detail == "installed"
+    metadata = registry.metadata_for("marian", "Helsinki-NLP/opus-mt-en-ine", "openvino_gpu")
+    assert metadata is not None
+    assert metadata["python_executable"] == r"C:\\Python313\\python.exe"
 
 
 def test_huggingface_windows_privilege_error_is_rewritten():

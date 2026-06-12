@@ -55,6 +55,7 @@ def test_marian_english_polish_falls_back_to_en_ine(monkeypatch, tmp_path: Path)
         "_probe_huggingface_model",
         lambda model_id, refresh=False: (model_id == "Helsinki-NLP/opus-mt-en-ine", None, "cached"),
     )
+    monkeypatch.setattr("polylinguist.services.model_catalog.compatible_runtime_block_reason", lambda target, system_name=None: None)
     profile = SystemProfile("windows", "amd64", 8, 16.0, 20.0, True, False)
     response = catalog.list_models("eng", "pol", profile)
     marian = next(model for model in response.models if model.provider == "marian")
@@ -93,6 +94,7 @@ def test_marian_exposes_directml_and_openvino_targets(monkeypatch, tmp_path: Pat
     catalog = make_catalog(tmp_path)
     monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {})
     monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (True, None, "cached"))
+    monkeypatch.setattr("polylinguist.services.model_catalog.compatible_runtime_block_reason", lambda target, system_name=None: None)
     profile = SystemProfile(
         "windows",
         "amd64",
@@ -111,6 +113,35 @@ def test_marian_exposes_directml_and_openvino_targets(monkeypatch, tmp_path: Pat
     assert "directml" in marian.supported_targets
     assert "openvino_gpu" in marian.supported_targets
     assert marian.recommended_target == "openvino_gpu"
+
+
+def test_marian_hides_openvino_without_compatible_python_runtime(monkeypatch, tmp_path: Path):
+    catalog = make_catalog(tmp_path)
+    monkeypatch.setattr(catalog, "_fetch_argos_index", lambda: {})
+    monkeypatch.setattr(catalog, "_probe_huggingface_model", lambda model_id, refresh=False: (True, None, "cached"))
+    monkeypatch.setattr(
+        "polylinguist.services.model_catalog.compatible_runtime_block_reason",
+        lambda target, system_name=None: (
+            "OpenVINO GPU on Windows requires a discovered Python 3.13 or earlier runtime. Polylinguist did not find one."
+            if target == "openvino_gpu"
+            else None
+        ),
+    )
+    profile = SystemProfile(
+        "windows",
+        "amd64",
+        8,
+        16.0,
+        20.0,
+        False,
+        False,
+        accelerators=(AcceleratorInfo(vendor="intel", name="Arc A750", supported_targets=("openvino_gpu",)),),
+    )
+
+    response = catalog.list_models("eng", "spa", profile)
+
+    marian = next(model for model in response.models if model.provider == "marian")
+    assert "openvino_gpu" not in marian.supported_targets
 
 
 def test_removed_marian_cpu_target_hides_shared_hf_cache(monkeypatch, tmp_path: Path):

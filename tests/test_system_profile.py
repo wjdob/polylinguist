@@ -90,3 +90,18 @@ def test_python_314_disables_openvino_gpu_support(monkeypatch):
     monkeypatch.setattr("polylinguist.services.system_profile.sys.version_info", (3, 14, 1))
 
     assert _python_supports_openvino_gpu() is False
+
+
+def test_detect_accelerators_keeps_arc_visible_when_service_python_is_314(monkeypatch):
+    monkeypatch.setattr(
+        "polylinguist.services.system_profile._detect_windows_video_adapters",
+        lambda: [_VideoAdapter(vendor="intel", name="Intel(R) Arc(TM) A770 Graphics")],
+    )
+    monkeypatch.setattr("polylinguist.services.system_profile._detect_nvidia_gpu_names", lambda: [])
+    monkeypatch.setattr("polylinguist.services.system_profile.platform.system", lambda: "Windows")
+    monkeypatch.setattr("polylinguist.services.system_profile.sys.version_info", (3, 14, 1))
+
+    accelerators = list(_detect_accelerators("windows"))
+
+    assert len(accelerators) == 1
+    assert accelerators[0].supported_targets == ("openvino_gpu",)

@@ -645,6 +645,15 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       border-color: #a3232d;
       color: #fff;
     }}
+    .button-row {{
+      display: flex;
+      gap: 10px;
+      margin-top: 6px;
+    }}
+    .button-row button {{
+      margin-top: 0;
+      flex: 1;
+    }}
     .model-list {{
       display: grid;
       gap: 14px;
@@ -848,7 +857,10 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
               <option value="openvino_gpu">GPU (OpenVINO)</option>
             </select>
           </label>
-          <button id="refresh-models" type="button">Evaluate models</button>
+          <div class="button-row">
+            <button id="refresh-models" type="button">Evaluate models</button>
+            <button id="refresh-models-online" type="button" class="secondary">Refresh availability</button>
+          </div>
         </section>
 
         <section class="panel">
@@ -1250,17 +1262,25 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       activeInstallPoll = setInterval(tick, 1200);
     }}
 
-    async function evaluateModels() {{
+    async function evaluateModels(refresh = false) {{
       const settings = readSettings();
       currentSettings = settings;
       renderManifest(settings);
-      document.getElementById("model-status").textContent = "Checking local recommendation and model availability...";
+      document.getElementById("model-status").textContent = refresh
+        ? "Refreshing online model metadata and machine recommendation..."
+        : "Checking local recommendation and cached model availability...";
       try {{
-        const payload = await loadJson("/api/models?source_lang=" + settings.source_lang + "&target_lang=" + settings.target_lang + "&refresh=true");
+        const payload = await loadJson(
+          "/api/models?source_lang=" + settings.source_lang +
+          "&target_lang=" + settings.target_lang +
+          "&refresh=" + (refresh ? "true" : "false")
+        );
         renderModels(payload);
         currentSettings = readSettings();
         renderManifest(currentSettings);
-        document.getElementById("model-status").textContent = "";
+        document.getElementById("model-status").textContent = refresh
+          ? "Online metadata refreshed. Model notes now show the latest cache timestamps."
+          : "Loaded local/cache-first model availability. Use Refresh availability when you want an online metadata refresh.";
       }} catch (error) {{
         document.getElementById("model-status").textContent = error.message;
       }}
@@ -1357,12 +1377,13 @@ def render_configure_page(api_base_url: str, manifest_base_url: str, admin_requi
       fillLanguages(languages);
       renderSystemProfile(profile);
       applySettingsToForm(envelope.settings);
-      await evaluateModels();
+      await evaluateModels(false);
       await refreshSubtitleActivity();
       setInterval(refreshSubtitleActivity, 1000);
     }}
 
-    document.getElementById("refresh-models").addEventListener("click", evaluateModels);
+    document.getElementById("refresh-models").addEventListener("click", () => evaluateModels(false));
+    document.getElementById("refresh-models-online").addEventListener("click", () => evaluateModels(true));
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("copy-manifest").addEventListener("click", copyManifestUrl);
     document.getElementById("source-lang").addEventListener("change", refreshManifestPreview);
